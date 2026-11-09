@@ -111,7 +111,7 @@ class Buffer {
 // This is because static_assert only works with compile-time constants, but
 // mac uses libstdc++4.2, android uses stlport and gcc doesn't support keyword
 // constexpr until 4.6, which all don't mark numeric_limits::max() as constexp.
-#if defined(BASE_CXX11_ENABLED) \
+#if defined(BUTIL_CXX11_ENABLED) \
     && !(defined(__GNUC__) && __GNUC__ * 10000 + __GNUC_MINOR__ * 100 < 40600) \
     && !defined(OS_ANDROID) && !defined(OS_MACOSX) && !defined(OS_IOS)
     BAIDU_CASSERT(kSSizeMaxConst == \
@@ -315,7 +315,7 @@ bool Buffer::IToASCII(bool sign, bool upcase, int64_t i, int base,
   // We cannot choose the easier approach of just reversing the number, as that
   // fails in situations where we need to truncate numbers that have padding
   // and/or prefixes.
-  const char* reverse_prefix = NULL;
+  const char* reverse_prefix = nullptr;
   if (prefix && *prefix) {
     if (pad == '0') {
       while (*prefix) {
@@ -324,13 +324,13 @@ bool Buffer::IToASCII(bool sign, bool upcase, int64_t i, int base,
         }
         Out(*prefix++);
       }
-      prefix = NULL;
+      prefix = nullptr;
     } else {
       for (reverse_prefix = prefix; *reverse_prefix; ++reverse_prefix) {
       }
     }
   } else
-    prefix = NULL;
+    prefix = nullptr;
   const size_t prefix_length = reverse_prefix - prefix;
 
   // Loop until we have converted the entire number. Output at least one
@@ -527,7 +527,7 @@ ssize_t SafeSNPrintf(char* buf, size_t sz, const char* fmt, const Arg* args,
 
         const Arg& arg = args[cur_arg++];
         int64_t i;
-        const char* prefix = NULL;
+        const char* prefix = nullptr;
         if (ch != 'p') {
           // Check that the argument has the expected type.
           if (arg.type != Arg::INT && arg.type != Arg::UINT) {

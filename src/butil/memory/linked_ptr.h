@@ -34,8 +34,8 @@
 //  - is thread safe for copying and deletion
 //  - supports weak_ptrs
 
-#ifndef BASE_MEMORY_LINKED_PTR_H_
-#define BASE_MEMORY_LINKED_PTR_H_
+#ifndef BUTIL_MEMORY_LINKED_PTR_H_
+#define BUTIL_MEMORY_LINKED_PTR_H_
 
 #include "butil/logging.h"  // for CHECK macros
 
@@ -80,7 +80,7 @@ class linked_ptr {
 
   // Take over ownership of a raw pointer.  This should happen as soon as
   // possible after the object is created.
-  explicit linked_ptr(T* ptr = NULL) { capture(ptr); }
+  explicit linked_ptr(T* ptr = nullptr) { capture(ptr); }
   ~linked_ptr() { depart(); }
 
   // Copy an existing linked_ptr<>, adding ourselves to the list of references.
@@ -107,7 +107,7 @@ class linked_ptr {
   }
 
   // Smart pointer members.
-  void reset(T* ptr = NULL) {
+  void reset(T* ptr = nullptr) {
     depart();
     capture(ptr);
   }
@@ -120,7 +120,7 @@ class linked_ptr {
     bool last = link_.depart();
     CHECK(last);
     T* v = value_;
-    value_ = NULL;
+    value_ = nullptr;
     return v;
   }
 
@@ -178,4 +178,4 @@ linked_ptr<T> make_linked_ptr(T* ptr) {
   return linked_ptr<T>(ptr);
 }
 
-#endif  // BASE_MEMORY_LINKED_PTR_H_
+#endif  // BUTIL_MEMORY_LINKED_PTR_H_

@@ -2,17 +2,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include "base/strings/sys_string_conversions.h"
+#include "butil/strings/sys_string_conversions.h"
 
 #import <Foundation/Foundation.h>
 
 #include <vector>
 
-#include "base/mac/foundation_util.h"
-#include "base/mac/scoped_cftyperef.h"
-#include "base/strings/string_piece.h"
+#include "butil/mac/foundation_util.h"
+#include "butil/mac/scoped_cftyperef.h"
+#include "butil/strings/string_piece.h"
 
-namespace base {
+namespace butil {
 
 namespace {
 
@@ -34,7 +34,7 @@ static StringType CFStringToSTLStringWithEncodingT(CFStringRef cfstring,
                                        encoding,
                                        0,      // lossByte
                                        false,  // isExternalRepresentation
-                                       NULL,   // buffer
+                                       nullptr,   // buffer
                                        0,      // maxBufLen
                                        &out_size);
   if (converted == 0 || out_size == 0)
@@ -56,7 +56,7 @@ static StringType CFStringToSTLStringWithEncodingT(CFStringRef cfstring,
                                false,  // isExternalRepresentation
                                reinterpret_cast<UInt8*>(&out_buffer[0]),
                                out_size,
-                               NULL);  // usedBufLen
+                               nullptr);  // usedBufLen
   if (converted == 0)
     return StringType();
 
@@ -78,8 +78,8 @@ static OutStringType STLStringToSTLStringWithEncodingsT(
   if (in_length == 0)
     return OutStringType();
 
-  base::ScopedCFTypeRef<CFStringRef> cfstring(CFStringCreateWithBytesNoCopy(
-      NULL,
+  butil::ScopedCFTypeRef<CFStringRef> cfstring(CFStringCreateWithBytesNoCopy(
+      nullptr,
       reinterpret_cast<const UInt8*>(in.data()),
       in_length * sizeof(typename InStringType::value_type),
       in_encoding,
@@ -93,7 +93,7 @@ static OutStringType STLStringToSTLStringWithEncodingsT(
 }
 
 // Given an STL string |in| with an encoding specified by |in_encoding|,
-// return it as a CFStringRef.  Returns NULL on failure.
+// return it as a CFStringRef.  Returns nullptr on failure.
 template<typename StringType>
 static CFStringRef STLStringToCFStringWithEncodingsT(
     const StringType& in,
@@ -152,12 +152,12 @@ CFStringRef SysUTF16ToCFStringRef(const string16& utf16) {
 }
 
 NSString* SysUTF8ToNSString(const std::string& utf8) {
-  return (NSString*)base::mac::CFTypeRefToNSObjectAutorelease(
+  return (NSString*)butil::mac::CFTypeRefToNSObjectAutorelease(
       SysUTF8ToCFStringRef(utf8));
 }
 
 NSString* SysUTF16ToNSString(const string16& utf16) {
-  return (NSString*)base::mac::CFTypeRefToNSObjectAutorelease(
+  return (NSString*)butil::mac::CFTypeRefToNSObjectAutorelease(
       SysUTF16ToCFStringRef(utf16));
 }
 
@@ -183,4 +183,4 @@ string16 SysNSStringToUTF16(NSString* nsstring) {
   return SysCFStringRefToUTF16(reinterpret_cast<CFStringRef>(nsstring));
 }
 
-}  // namespace base
+}  // namespace butil

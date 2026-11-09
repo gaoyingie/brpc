@@ -1,143 +1,253 @@
-# BUILD
+[English version](../en/getting_started.md)
 
-brpc prefers static linking of deps, so that they don't have to be installed on every machine running the app.
+# 构建
 
-brpc depends on following packages:
+brpc鼓励静态链接依赖，以便于每个运行brpc服务的机器不必再安装依赖。
+
+brpc有如下依赖：
 
 * [gflags](https://github.com/gflags/gflags): Extensively used to define global options.
 * [protobuf](https://github.com/google/protobuf): Serializations of messages, interfaces of services.
-* [leveldb](https://github.com/google/leveldb): Required by [/rpcz](rpcz.md) to record RPCs for tracing.
+* [leveldb](https://github.com/google/leveldb): Required by [rpcz](rpcz.md) to record RPCs for tracing.
+
+# 支持的环境
+
+* [Ubuntu/LinuxMint/WSL](#ubuntulinuxmintwsl)
+* [Fedora/CentOS](#fedoracentos)
+* [自己构建依赖的Linux](#自己构建依赖的Linux)
+* [MacOS](#macos)
+* [docker](#docker)
 
 ## Ubuntu/LinuxMint/WSL
-### Prepare deps
+### 依赖准备
 
-Install common deps:
-```
-$ sudo apt-get install git g++ make libssl-dev
-```
-
-Install [gflags](https://github.com/gflags/gflags), [protobuf](https://github.com/google/protobuf), [leveldb](https://github.com/google/leveldb):
-```
-$ sudo apt-get install libgflags-dev libprotobuf-dev libprotoc-dev protobuf-compiler libleveldb-dev
+安装依赖：
+```shell
+sudo apt-get install -y git g++ make libssl-dev libgflags-dev libprotobuf-dev libprotoc-dev protobuf-compiler libleveldb-dev
 ```
 
-If you need to statically link leveldb:
-```
-$ sudo apt-get install libsnappy-dev
+如果你需要静态链接leveldb：
+```shell
+sudo apt-get install -y libsnappy-dev
 ```
 
-### Compile brpc
-git clone brpc, cd into the repo and run
+如果你需要通过源码编译生成 leveldb 静态库：
+
+```shell
+git clone --recurse-submodules https://github.com/google/leveldb.git
+mkdir -p build && cd build
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_POSITION_INDEPENDENT_CODE=ON .. && cmake --build .
+sudo cp -r ../include/leveldb /usr/include/ && sudo cp libleveldb.a /usr/lib/
 ```
+
+如果你要在样例中启用cpu/heap的profiler：
+
+```shell
+sudo apt-get install -y libgoogle-perftools-dev
+```
+
+如果你要运行测试，那么要安装并编译libgtest-dev（它没有被默认编译）：
+```shell
+sudo apt-get install -y cmake libgtest-dev && cd /usr/src/gtest && sudo cmake . && sudo make && sudo mv lib/libgtest* /usr/lib/ && cd -
+```
+gtest源码目录可能变动，如果`/usr/src/gtest`不存在，请尝试`/usr/src/googletest/googletest`。
+
+### 使用config_brpc.sh编译brpc
+git克隆brpc，进入到项目目录，然后运行
+```shell
 $ sh config_brpc.sh --headers=/usr/include --libs=/usr/lib
 $ make
 ```
-To change compiler to clang, add `--cxx=clang++ --cc=clang`.
+修改编译器为clang，添加选项`--cxx=clang++ --cc=clang`。
 
-To not link debugging symbols, add `--nodebugsymbols` and compiled binaries will be much smaller.
+不想链接调试符号，添加选项`--nodebugsymbols`，然后编译将会得到更轻量的二进制文件。
 
-### Run example
+使用glog版的brpc，添加选项`--with-glog`。
 
-```
+要启用 [thrift 支持](../en/thrift.md)，首先安装thrift并且添加选项`--with-thrift`。
+
+**运行样例**
+
+```shell
 $ cd example/echo_c++
 $ make
 $ ./echo_server &
 $ ./echo_client
 ```
-Examples link brpc statically, if you need to link the shared version, `make clean` and `LINK_SO=1 make`
 
-To run examples with cpu/heap profilers, install `libgoogle-perftools-dev` and re-run `config_brpc.sh` before compiling.
+上述操作会链接brpc的静态库到样例中，如果你想链接brpc的共享库，请依次执行：`make clean`和`LINK_SO=1 make`
 
-### Run tests
-Install and compile libgtest-dev (which is not compiled yet):
-
+**运行测试**
 ```shell
-sudo apt-get install libgtest-dev
-cd /usr/src/gtest && sudo cmake . && sudo make && sudo mv libgtest* /usr/lib/
+$ cd test
+$ make
+$ sh run_tests.sh
 ```
 
-The directory of gtest source code may be changed, try `/usr/src/googletest/googletest` if `/usr/src/gtest` is not there.
+### 使用cmake编译brpc
 
-Rerun `config_brpc.sh`, `make` in test/, and `sh run_tests.sh`
+```shell
+mkdir build && cd build && cmake .. && cmake --build . -j6
+```
+对于 cmake 3.13+ 也可以使用如下命令进行编译:
+```shell
+cmake -B build && cmake --build build -j6
+```
+要帮助VSCode或Emacs(LSP)去正确地理解代码，添加`-DCMAKE_EXPORT_COMPILE_COMMANDS=ON`选项去生成`compile_commands.json`。
+
+要修改编译器为clang，请修改环境变量`CC`和`CXX`为`clang`和`clang++`。
+
+不想链接调试符号，请移除`build/CMakeCache.txt`，然后用`-DWITH_DEBUG_SYMBOLS=OFF`选项执行cmake。
+
+想要让brpc使用glog，用`-DWITH_GLOG=ON`选项执行cmake。
+
+要启用 [thrift 支持](../en/thrift.md)，先安装thrift，然后用`-DWITH_THRIFT=ON`选项执行cmake。
+
+**用cmake运行样例**
+
+先在仓库根目录安装 brpc。CMake 会直接安装头文件和库，不再在编译时将
+头文件暂存到 `output/include`。在配置阶段设置安装前缀，确保生成的
+pkg-config 元数据使用相同的前缀，再将此前缀传给样例：
+
+```shell
+$ cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$PWD/build/output"
+$ cmake --build build -j6
+$ cmake --install build
+$ cd example/echo_c++
+$ cmake -B build -DCMAKE_PREFIX_PATH="$PWD/../../build/output"
+$ cmake --build build -j4
+$ cd build
+$ ./echo_server &
+$ ./echo_client
+```
+
+上述操作会链接brpc的静态库到样例中，如果你想链接brpc的共享库，请先移除`CMakeCache.txt`，然后用`-DLINK_SO=ON`选项重新执行cmake。
+
+**运行测试**
+
+```shell
+$ mkdir build && cd build && cmake -DBUILD_UNIT_TESTS=ON .. && make && make test
+```
+
+### 使用 Bazel 编译 brpc
+
+bRPC 也支持 Bazel 构建。`example/build_with_bazel_module` 下的 bzlmod 示例会基于本地
+bRPC 源码构建 server 和 client：
+
+```shell
+$ cd example/build_with_bazel_module
+$ bazel build //:echo_c++_server //:echo_c++_client
+```
+
+如果要把 bRPC 作为 Bazel 依赖使用，包括需要配置的 registry 和 `MODULE.bazel`，
+请参考 [Bazel 支持](bazel_support.md)。
 
 ## Fedora/CentOS
 
-### Prepare deps
+### 依赖准备
 
-CentOS needs to install EPEL generally otherwise many packages are not available by default.
-```
+CentOS一般需要安装EPEL，否则很多包都默认不可用。
+```shell
 sudo yum install epel-release
 ```
 
-Install common deps:
-```
-sudo yum install git g++ make openssl-devel
+安装依赖：
+```shell
+sudo yum install git gcc-c++ make openssl-devel gflags-devel protobuf-devel protobuf-compiler leveldb-devel
 ```
 
-Install [gflags](https://github.com/gflags/gflags), [protobuf](https://github.com/google/protobuf), [leveldb](https://github.com/google/leveldb):
+如果你要在样例中启用cpu/heap的profiler：
+```shell
+sudo yum install gperftools-devel
 ```
-sudo yum install gflags-devel protobuf-devel protobuf-compiler leveldb-devel
-```
-### Compile brpc
 
-git clone brpc, cd into the repo and run
-
+如果你要运行测试，那么要安装ligtest-dev:
+```shell
+sudo yum install gtest-devel
 ```
-$ sh config_brpc.sh --headers=/usr/include --libs=/usr/lib64
+
+### 使用config_brpc.sh编译brpc
+
+git克隆brpc，进入项目目录然后执行：
+
+```shell
+$ sh config_brpc.sh --headers="/usr/include" --libs="/usr/lib64 /usr/bin"
 $ make
 ```
-To change compiler to clang, add `--cxx=clang++ --cc=clang`.
+修改编译器为clang，添加选项`--cxx=clang++ --cc=clang`。
 
-To not link debugging symbols, add `--nodebugsymbols` and compiled binaries will be much smaller.
+不想链接调试符号，添加选项`--nodebugsymbols` 然后编译将会得到更轻量的二进制文件。
 
-### Run example
+想要让brpc使用glog，添加选项：`--with-glog`。
 
-```
+要启用 [thrift 支持](../en/thrift.md)，先安装thrift，然后添加选项：`--with-thrift`。
+
+**运行样例**
+
+```shell
 $ cd example/echo_c++
 $ make
 $ ./echo_server &
 $ ./echo_client
 ```
-Examples link brpc statically, if you need to link the shared version, `make clean` and `LINK_SO=1 make`
 
-To run examples with cpu/heap profilers, install `gperftools-devel` and re-run `config_brpc.sh` before compiling.
+上述操作会链接brpc的静态库到样例中，如果你想链接brpc的共享库，请依次执行：`make clean`和`LINK_SO=1 make`
 
-### Run tests
-
-Install gtest-devel.
-
-Rerun `config_brpc.sh`, `make` in test/, and `sh run_tests.sh`
-
-## Linux with self-built deps
-
-### Prepare deps
-
-brpc builds itself to both static and shared libs by default, so it needs static and shared libs of deps to be built as well.
-
-Take [gflags](https://github.com/gflags/gflags) as example, which does not build shared lib by default, you need to pass options to `cmake` to change the behavior:
-```
-cmake . -DBUILD_SHARED_LIBS=1 -DBUILD_STATIC_LIBS=1
-make
+**运行测试**
+```shell
+$ cd test
+$ make
+$ sh run_tests.sh
 ```
 
-### Compile brpc
+### 使用cmake编译brpc
+参考[这里](#使用cmake编译brpc)
 
-Keep on with the gflags example, let `../gflags_dev` be where gflags is cloned.
+### 使用vcpkg编译brpc
 
-git clone brpc. cd into the repo and run
+[vcpkg](https://github.com/microsoft/vcpkg) 是一个全平台支持的包管理器，你可以使用以下步骤vcpkg轻松编译brpc:
 
+```shell
+$ git clone https://github.com/microsoft/vcpkg.git
+$ ./bootstrap-vcpkg.bat # 使用 powershell
+$ ./bootstrap-vcpkg.sh # 使用 bash
+$ ./vcpkg install brpc
 ```
+
+## 自己构建依赖的Linux
+
+### 依赖准备
+
+brpc默认会构建出静态库和共享库，因此它也需要依赖有静态库和共享库两个版本。
+
+以[gflags](https://github.com/gflags/gflags)为例，它默认不构建共享库，你需要给`cmake`指定选项去改变这一行为：
+```shell
+$ cmake . -DBUILD_SHARED_LIBS=1 -DBUILD_STATIC_LIBS=1
+$ make
+```
+
+### 编译brpc
+
+还以gflags为例，`../gflags_dev`表示gflags被克隆的位置。
+
+git克隆brpc。进入到项目目录然后运行：
+
+```shell
 $ sh config_brpc.sh --headers="../gflags_dev /usr/include" --libs="../gflags_dev /usr/lib64"
 $ make
 ```
 
-To change compiler to clang, add `--cxx=clang++ --cc=clang`.
+这里我们给`--headers`和`--libs`传递多个路径使得脚本能够在多个地方进行检索。你也可以打包所有依赖和brpc一起放到一个目录中，然后把目录传递给 --headers/--libs选项，它会递归搜索所有子目录直到找到必须的文件。
 
-To not link debugging symbols, add `--nodebugsymbols` and compiled binaries will be much smaller.
+修改编译器为clang，添加选项`--cxx=clang++ --cc=clang`。
 
-Here we pass multiple paths to `--headers` and `--libs` to make the script search for multiple places. You can also group all deps and brpc into one directory, then pass the directory to --headers/--libs which actually search all subdirectories recursively and will find necessary files.
+不想链接调试符号，添加选项`--nodebugsymbols`，然后编译将会得到更轻量的二进制文件。
 
-```
+使用glog版的brpc，添加选项`--with-glog`。
+
+要启用[thrift 支持](../en/thrift.md)，首先安装thrift并且添加选项`--with-thrift`。
+
+```shell
 $ ls my_dev
 gflags_dev protobuf_dev leveldb_dev brpc_dev
 $ cd brpc_dev
@@ -145,67 +255,208 @@ $ sh config_brpc.sh --headers=.. --libs=..
 $ make
 ```
 
-# Supported deps
+### 使用cmake编译brpc
+参考[这里](#使用cmake编译brpc)
 
-## GCC: 4.8-7.1
+## MacOS
 
-c++11 is  turned on by default to remove dependency on boost (atomic).
+注意：在相同硬件条件下，MacOS版brpc的性能可能明显差于Linux版。如果你的服务是性能敏感的，请不要使用MacOS作为你的生产环境。
 
-The over-aligned issues in GCC7 is suppressed temporarily now.
+### Apple Silicon
 
-Using other versions of gcc may generate warnings, contact us to fix.
+master HEAD已支持M1系列芯片，M2未测试过。欢迎通过issues向我们报告遗留的warning/error。
 
-Adding `-D__const__=` to cxxflags in your makefiles is a must avoid [errno issue in gcc4+](thread_local.md)。
+### 依赖准备
+
+安装依赖：
+```shell
+brew install ./homebrew-formula/protobuf.rb
+brew install openssl git gnu-getopt coreutils gflags leveldb
+```
+
+如果你要在样例中启用cpu/heap的profiler：
+```shell
+brew install gperftools
+```
+
+如果你要运行测试，需安装gtest。先运行`brew install googletest`看看homebrew是否支持（老版本没有），没有的话请下载和编译googletest：
+```shell
+git clone https://github.com/google/googletest -b release-1.10.0 && cd googletest/googletest && mkdir build && cd build && cmake -DCMAKE_CXX_FLAGS="-std=c++14" .. && make
+```
+在编译完成后，复制`include/`和`lib/`目录到`/usr/local/include`和`/usr/local/lib`目录中，以便于让所有应用都能使用gtest。
+
+### OpenSSL
+Monterey中openssl的安装位置可能不再位于`/usr/local/opt/openssl`，很可能会在`/opt/homebrew/Cellar`目录下，如果编译时报告找不到openssl：
+
+* 先运行`brew link openssl --force`看看`/usr/local/opt/openssl`是否出现了
+* 没有的话可以自行设置软链：`sudo ln -s /opt/homebrew/Cellar/openssl@3/3.0.3 /usr/local/opt/openssl`。请注意此命令中openssl的目录可能随环境变化而变化，可通过`brew info openssl`查看。
+
+### 使用 CMake 编译 Debug 版 brpc
+
+Apple Silicon 可以使用 Homebrew 安装的依赖编译 Debug 版本：
+
+```shell
+cmake -S . -B build -G "Unix Makefiles" \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DDEBUG=ON \
+  -DCMAKE_OSX_ARCHITECTURES=arm64 \
+  -DCMAKE_OSX_SYSROOT="$(xcrun --sdk macosx --show-sdk-path)" \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix)" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
+cmake --build build --parallel
+```
+
+该命令使用单配置的Unix Makefiles生成器，因此`CMAKE_BUILD_TYPE=Debug`会选择
+CMake的Debug构建配置。`DEBUG=ON`启用brpc的调试日志并保留断言。构建产物位于
+`build/output/`。
+
+如需为 clangd 等工具生成编译数据库，请在配置命令中添加以下可选项：
+
+```shell
+-DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+```
+
+生成的编译数据库位于 `build/compile_commands.json`。
+
+如果 CMake 报错 `tapi error: malformed file`，请确认 Command Line Tools 与 Xcode
+版本一致，并选择当前安装的 Xcode：
+
+```shell
+sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
+```
+
+如果问题仍然存在，请检查`xcrun --sdk macosx --show-sdk-path`返回的SDK路径是否有效。
+
+### 使用config_brpc.sh编译brpc
+git克隆brpc，进入到项目目录然后运行：
+```shell
+$ sh config_brpc.sh --headers=/usr/local/include --libs=/usr/local/lib --cc=clang --cxx=clang++
+$ make
+```
+MacOS Monterey下的brew安装路径可能改变，如有路径相关的错误，可考虑设置如下：
+
+```shell
+$ sh config_brpc.sh --headers=/opt/homebrew/include --libs=/opt/homebrew/lib --cc=clang --cxx=clang++
+$ make
+```
+
+不想链接调试符号，添加选项`--nodebugsymbols`，然后编译将会得到更轻量的二进制文件。
+
+使用glog版的brpc，添加选项`--with-glog`。
+
+要启用[thrift 支持](../en/thrift.md)，首先安装thrift并且添加选项`--with-thrift`。
+
+**运行样例**
+
+```shell
+$ cd example/echo_c++
+$ make
+$ ./echo_server &
+$ ./echo_client
+```
+上述操作会链接brpc的静态库到样例中，如果你想链接brpc的共享库，请依次执行：`make clean`和`LINK_SO=1 make`
+
+**运行测试**
+```shell
+$ cd test
+$ make
+$ sh run_tests.sh
+```
+
+### 使用cmake编译brpc
+参考[这里](#使用cmake编译brpc)
+
+## Docker
+使用docker 编译brpc：
+
+```shell
+$ mkdir -p ~/brpc
+$ cd ~/brpc
+$ git clone https://github.com/apache/brpc.git
+$ cd brpc
+$ docker build -t brpc:master .
+$ docker images
+$ docker run -it brpc:master /bin/bash
+```
+
+# 支持的依赖
+
+## GCC: 5.0-11.2
+
+**推荐 8.2 及以上版本。**
+
+默认启用 c++14，以去除对 boost 的依赖（比如 atomic）。
+
+理论支持 c++14 的编译器都应可以，但部分编译器版本对 c++14 的支持存在问题。
+
+GCC7中over-aligned的问题暂时被禁止。
+
+使用其他版本的gcc可能会产生编译警告，请联系我们予以修复。
+
+请在makefile中给cxxflags增加`-D__const__=__unused__`选项以避免[gcc4+中的errno问题](thread_local.md).
 
 ## Clang: 3.5-4.0
 
-unittests can't be compiled with clang yet.
+无已知问题。
 
 ## glibc: 2.12-2.25
 
-no known issues.
+无已知问题。
 
-## protobuf: 2.4-3.2
+## protobuf: 3.0-5.29
 
-Be compatible with pb 3.0 and pb 2.x with the same file:
-Don't use new types in proto3 and start the proto file with `syntax="proto2";`
-[tools/add_syntax_equal_proto2_to_all.sh](https://github.com/brpc/brpc/blob/master/tools/add_syntax_equal_proto2_to_all.sh)can add `syntax="proto2"` to all proto files without it.
-protobuf 3.3-3.4 is not tested yet.
+bRPC 中使用了 protobuf 内部 API，上游不保证相关 API 的兼容性，目前测试可以支持到 v29(5.29)，如有问题欢迎[反馈](https://github.com/apache/brpc/issues)。
 
-## gflags: 2.0-2.21
+[1.8.0](https://github.com/apache/brpc/releases/tag/1.8.0) 中 [#2406](https://github.com/apache/brpc/pull/2406) 和 [#2493](https://github.com/apache/brpc/pull/2493)引入了部分 proto3 语法，所以目前 bRPC 不再兼容 protobuf 2.x 版本。如果你希望使用 2.x 版本，可以使用 1.8.0 之前的 bRPC 版本。
 
-no known issues.
+## gflags: 2.1-2.2.2
+
+2.1.1 中存在一处已知问题，需要[补丁](https://github.com/gflags/gflags/commit/408061b46974cc8377a8a794a048ecae359ad887)。
 
 ## openssl: 0.97-1.1
 
-required by https.
+被https功能需要。
 
 ## tcmalloc: 1.7-2.5
 
-brpc does **not** link [tcmalloc](http://goog-perftools.sourceforge.net/doc/tcmalloc.html) by default. Users link tcmalloc on-demand.
+brpc默认**不**链接 [tcmalloc](http://goog-perftools.sourceforge.net/doc/tcmalloc.html)。用户按需要链接tcmalloc。
 
-Comparing to ptmalloc embedded in glibc, tcmalloc often improves performance. However different versions of tcmalloc may behave really differently. For example, tcmalloc 2.1 may make multi-threaded examples in brpc perform significantly worse(due to a spinlock in tcmalloc) than the one using tcmalloc 1.7 and 2.5. Even different minor versions may differ. When you program behave unexpectedly, remove tcmalloc or try another version.
+和glibc内置的ptmalloc相比，tcmalloc通常能提升性能。然而不同版本的tcmalloc可能表现迥异。例如：tcmalloc 2.1与 tcmalloc 1.7和2.5相比，可能会让brpc的多线程样例性能显著恶化（tcmalloc中的一个自旋锁导致的）。甚至不同的小版本号之间变现也可能不同。当你的程序表现不符合预期的时候，移除tcmalloc然后尝试其他版本。
 
-Code compiled with gcc 4.8.2 when linking to a tcmalloc compiled with earlier GCC may crash or deadlock before main(), E.g:
+用gcc4.8.2编译然后链接更早版本GCC编译的tcmalloc，可能会让程序中main()函数之前挂掉或者死锁，例如：
 
 ![img](../images/tcmalloc_stuck.png)
 
-When you meet the issue, compile tcmalloc with the same GCC as the RPC code.
+当你遇到这个问题的时候，请用同一个GCC重新编译tcmalloc。
 
-Another common issue with tcmalloc is that it does not return memory to system as early as ptmalloc. So when there's an invalid memory access, the program may not crash directly,  instead it crashes at a unrelated place, or even not crash. When you program has weird memory issues, try removing tcmalloc.
+另外一个使用tcmalloc的常见问题是，它不会像 ptmalloc一样及时地归还内存给系统。因此当有一个无效的内存访问的时候，程序可能不会直接挂掉，取而代之的是它可能在一个不相关的地方挂掉，或者甚至一直不挂掉。当你的程序出现怪异的内存问题的时候，尝试移除tcmalloc。
 
-If you want to use [cpu profiler](cpu_profiler.md) or [heap profiler](heap_profiler.md), do link `libtcmalloc_and_profiler.a`. These two profilers are based on tcmalloc.[contention profiler](contention_profiler.md) does not require tcmalloc.
+如果你要使用[cpu profiler](cpu_profiler.md)或[heap profiler](heap_profiler.md)，要链接`libtcmalloc_and_profiler.a`。这两个 profiler都是基于tcmalloc的。而[contention profiler](contention_profiler.md)不需要tcmalloc。
 
-When you remove tcmalloc, not only remove the linking with tcmalloc but also the macros: `-DBRPC_ENABLE_CPU_PROFILER`.
+当你移除tcmalloc的时候，不仅要移除tcmalloc的链接，也要移除宏`-DBRPC_ENABLE_CPU_PROFILER`。
 
 ## glog: 3.3+
 
-brpc implementes a default [logging utility](../../src/butil/logging.h) which conflicts with glog. To replace this with glog, add *--with-glog* to config_brpc.sh
+brpc实现了一个默认的[日志功能](../../src/butil/logging.h)它和glog冲突。要替换成glog，可以给config_brpc.sh增加`--with-glog`选项或者给cmake增加`-DWITH_GLOG=ON`选项。
 
 ## valgrind: 3.8+
 
-brpc detects valgrind automatically (and registers stacks of bthread). Older valgrind (say 3.2) is not supported.
+brpc会自动检测valgrind（然后注册bthread的栈）。不支持老版本的valgrind（比如3.2）。
 
-# Track instances
+## thrift: 0.9.3-0.11.0
 
-We provide a program to help you to track and monitor all brpc instances. Just run [trackme_server](https://github.com/brpc/brpc/tree/master/tools/trackme_server/) somewhere and launch need-to-be-tracked instances with -trackme_server=SERVER. The trackme_server will receive pings from instances periodically and print logs when it does. You can aggregate instance addresses from the log and call builtin services of the instances for further information.
+无已知问题。
+
+## libunwind: 1.3-1.8.1
+
+bRPC默认**不**链接 [libunwind](https://github.com/libunwind/libunwind)。用户需要追踪bthread功能则链接libunwind，可以给config_brpc.sh增加`--with-bthread-tracer`选项或者给cmake增加`-DWITH_BTHREAD_TRACER=ON`选项，如果是用 bazel 构建，请添加 `--define with_bthread_tracer=true` 选项。
+
+建议使用最新版本的libunwind。
+
+## flatbuffers: 25.2.10
+
+可选依赖，默认不启用。bRPC 使用了 FlatBuffers builder 的内部接口，只接受该版本；使用其他版本见 [FlatBuffers 消息](flatbuffers.md)。
+
+# 实例追踪
+
+我们提供了一个程序去帮助你追踪和监控所有brpc实例。 只需要在某处运行 [trackme_server](https://github.com/apache/brpc/tree/master/tools/trackme_server/) 然后再带着 -trackme_server=SERVER参数启动需要被追踪的实例。trackme_server将从实例周期性地收到ping消息然后打印日志。您可以从日志中聚合实例地址，并调用实例的内置服务以获取更多信息。

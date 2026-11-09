@@ -1,35 +1,45 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Sep  7 22:37:39 CST 2014
 
-#ifndef BAIDU_BTHREAD_ALLOCATE_STACK_H
-#define BAIDU_BTHREAD_ALLOCATE_STACK_H
+#ifndef BTHREAD_ALLOCATE_STACK_H
+#define BTHREAD_ALLOCATE_STACK_H
 
 #include <assert.h>
 #include <gflags/gflags.h>          // DECLARE_int32
 #include "bthread/types.h"
 #include "bthread/context.h"        // bthread_fcontext_t
+#include "butil/build_config.h"
+#include "butil/compiler_specific.h"
 #include "butil/object_pool.h"
+
+// Discarding the continuation would leak ASan's saved fake stack.
+#if defined(OS_LINUX) && !defined(BUTIL_USE_ASAN)
+#define BTHREAD_STACK_TRIM_SUPPORTED
+#endif
 
 namespace bthread {
 
 struct StackStorage {
-     int stacksize;
-     int guardsize;
+     unsigned stacksize;
+     unsigned guardsize;
     // Assume stack grows upwards.
     // http://www.boost.org/doc/libs/1_55_0/libs/context/doc/html/context/stack.html
     void* bottom;
@@ -39,7 +49,7 @@ struct StackStorage {
     void zeroize() {
         stacksize = 0;
         guardsize = 0;
-        bottom = NULL;
+        bottom = nullptr;
         valgrind_stack_id = 0;
     }
 };
@@ -50,6 +60,13 @@ int allocate_stack_storage(StackStorage* s, int stacksize, int guardsize);
 // corresponding allocate_stack_storage() otherwise behavior is undefined.
 void deallocate_stack_storage(StackStorage* s);
 
+#if defined(BTHREAD_STACK_TRIM_SUPPORTED)
+namespace internal {
+// Called from TaskControl::init, never during command-line parsing.
+void init_stack_trimming();
+}
+#endif
+
 enum StackType {
     STACK_TYPE_MAIN = 0,
     STACK_TYPE_PTHREAD = BTHREAD_STACKTYPE_PTHREAD,
@@ -59,6 +76,7 @@ enum StackType {
 };
 
 struct ContextualStack {
+    virtual ~ContextualStack() = default;
     bthread_fcontext_t context;
     StackType stacktype;
     StackStorage storage;
@@ -67,7 +85,7 @@ struct ContextualStack {
 // Get a stack in the `type' and run `entry' at the first time that the
 // stack is jumped.
 ContextualStack* get_stack(StackType type, void (*entry)(intptr_t));
-// Recycle a stack. NULL does nothing.
+// Recycle a stack. nullptr does nothing.
 void return_stack(ContextualStack*);
 // Jump from stack `from' to stack `to'. `from' must be the stack of callsite
 // (to save contexts before jumping)
@@ -77,4 +95,4 @@ void jump_stack(ContextualStack* from, ContextualStack* to);
 
 #include "bthread/stack_inl.h"
 
-#endif  // BAIDU_BTHREAD_ALLOCATE_STACK_H
+#endif  // BTHREAD_ALLOCATE_STACK_H

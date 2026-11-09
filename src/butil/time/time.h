@@ -20,8 +20,8 @@
 // These classes are represented as only a 64-bit value, so they can be
 // efficiently passed by value.
 
-#ifndef BASE_TIME_TIME_H_
-#define BASE_TIME_TIME_H_
+#ifndef BUTIL_TIME_TIME_H_
+#define BUTIL_TIME_TIME_H_
 
 #include <time.h>
 
@@ -66,10 +66,13 @@ class TimeTicks;
 
 // TimeDelta ------------------------------------------------------------------
 
-class BASE_EXPORT TimeDelta {
+class BUTIL_EXPORT TimeDelta {
  public:
   TimeDelta() : delta_(0) {
   }
+
+  // Required by clang++ 11 on MacOS catalina
+  TimeDelta(const TimeDelta& other) : delta_(other.delta_) {}
 
   // Converts units of time to TimeDeltas.
   static TimeDelta FromDays(int days);
@@ -222,7 +225,7 @@ inline TimeDelta operator*(int64_t a, TimeDelta td) {
 // Time -----------------------------------------------------------------------
 
 // Represents a wall clock time in UTC.
-class BASE_EXPORT Time {
+class BUTIL_EXPORT Time {
  public:
   static const int64_t kMillisecondsPerSecond = 1000;
   static const int64_t kMicrosecondsPerMillisecond = 1000;
@@ -248,7 +251,7 @@ class BASE_EXPORT Time {
   // Represents an exploded time that can be formatted nicely. This is kind of
   // like the Win32 SYSTEMTIME structure or the Unix "struct tm" with a few
   // additions and changes to prevent errors.
-  struct BASE_EXPORT Exploded {
+  struct BUTIL_EXPORT Exploded {
     int year;          // Four digit year "2007"
     int month;         // 1-based month (values 1 = January, etc.)
     int day_of_week;   // 0-based day of week (0 = Sunday, etc.)
@@ -265,9 +268,12 @@ class BASE_EXPORT Time {
     bool HasValidValues() const;
   };
 
-  // Contains the NULL time. Use Time::Now() to get the current time.
+  // Contains the nullptr time. Use Time::Now() to get the current time.
   Time() : us_(0) {
   }
+
+  // Required by clang++ 11 on MacOS catalina
+  Time(const Time& other) : us_(other.us_) {}
 
   // Returns true if the time object has not been initialized.
   bool is_null() const {
@@ -595,7 +601,7 @@ inline Time TimeDelta::operator+(Time t) const {
 
 // TimeTicks ------------------------------------------------------------------
 
-class BASE_EXPORT TimeTicks {
+class BUTIL_EXPORT TimeTicks {
  public:
   // We define this even without OS_CHROMEOS for seccomp sandbox testing.
 #if defined(OS_LINUX)
@@ -607,6 +613,9 @@ class BASE_EXPORT TimeTicks {
 
   TimeTicks() : ticks_(0) {
   }
+
+  // Required by clang++ 11 on MacOS catalina
+  TimeTicks(const TimeTicks& other) : ticks_(other.ticks_) {}
 
   // Platform-dependent tick count representing "right now."
   // The resolution of this clock is ~1-15ms.  Resolution varies depending
@@ -762,4 +771,4 @@ inline TimeTicks TimeDelta::operator+(TimeTicks t) const {
 
 }  // namespace butil
 
-#endif  // BASE_TIME_TIME_H_
+#endif  // BUTIL_TIME_TIME_H_

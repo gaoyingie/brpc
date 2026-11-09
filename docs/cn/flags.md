@@ -1,4 +1,4 @@
-brpc使用gflags管理配置。如果你的程序也使用gflags，那么你应该已经可以修改和brpc相关的flags，你可以浏览[flags服务](http://brpc.baidu.com:8765/flags)了解每个flag的具体功能。如果你的程序还没有使用gflags，我们建议你使用，原因如下：
+brpc使用gflags管理配置。如果你的程序也使用gflags，那么你应该已经可以修改和brpc相关的flags，你可以浏览[flags服务](http://localhost:8765/flags)了解每个flag的具体功能。如果你的程序还没有使用gflags，我们建议你使用，原因如下：
 
 - 命令行和文件均可传入，前者方便做测试，后者适合线上运维。放在文件中的gflags可以reload。而configure只支持从文件读取配置。
 - 你可以在浏览器中查看brpc服务器中所有gflags，并对其动态修改（如果允许的话）。configure不可能做到这点。
@@ -6,7 +6,7 @@ brpc使用gflags管理配置。如果你的程序也使用gflags，那么你应�
 
 # Usage of gflags
 
-gflags一般定义在需要它的源文件中。#include <gflags/gflags.h>后在全局scope加入DEFINE_*<type>*(*<name>*, *<default-value>*, *<description>*); 比如：
+gflags一般定义在需要它的源文件中。#include <gflags/gflags.h>后在全局scope加入DEFINE_*\<type\>*(*\<name\>*, *\<default-value\>*, *\<description\>*); 比如：
 
 ```c++
 #include <gflags/gflags.h>
@@ -43,9 +43,9 @@ conf/gflags.conf: No such file or directory
 
 # flagfile
 
-在命令行中参数和值之间可不加等号，而在flagfile中一定要加。比如`./myapp -param 7`是ok的，但在`./myapp -flagfile=./gflags.conf`对应的gflags.conf中一定要写成**-param=7**或**--param=7**，否则就不正确且不会报错。
+在命令行中参数和值之间可不加等号，而在flagfile中一定要加。比如`./myapp -param 7`是ok的，但在`./myapp -flagfile=./gflags.conf`对应的gflags.conf中一定要写成 **-param=7** 或 **--param=7**，否则就不正确且不会报错。
 
-在命令行中字符串可用单引号或双引号包围，而在flagfile中不能加。比如`./myapp -name="tom"`或`./myapp -name='tom'`都是ok的，但在`./myapp -flagfile=./gflags.conf`对应的gflags.conf中一定要写成**-name=tom**或**--name=tom**，如果写成-name="tom"的话，引号也会作为值的一部分。配置文件中的值可以有空格，比如gflags.conf中写成-name=value with spaces是ok的，参数name的值就是value with spaces，而在命令行中要用引号括起来。
+在命令行中字符串可用单引号或双引号包围，而在flagfile中不能加。比如`./myapp -name="tom"`或`./myapp -name='tom'`都是ok的，但在`./myapp -flagfile=./gflags.conf`对应的gflags.conf中一定要写成 **-name=tom** 或 **--name=tom**，如果写成-name="tom"的话，引号也会作为值的一部分。配置文件中的值可以有空格，比如gflags.conf中写成-name=value with spaces是ok的，参数name的值就是value with spaces，而在命令行中要用引号括起来。
 
 flagfile中参数可由单横线(如-foo)或双横线(如--foo)打头，但不能以三横线或更多横线打头，否则的话是无效参数且不会报错!
 
@@ -55,7 +55,7 @@ flagfile中可以使用`--flagfile包含另一个flagfile。`
 
 # Change gflag on-the-fly
 
-[flags服务](http://brpc.baidu.com:8765/flags)可以查看服务器进程中所有的gflags。修改过的flags会以红色高亮。“修改过”指的是修改这一行为，即使再改回默认值，仍然会显示为红色。
+[flags服务](http://localhost:8765/flags)可以查看服务器进程中所有的gflags。修改过的flags会以红色高亮。“修改过”指的是修改这一行为，即使再改回默认值，仍然会显示为红色。
 
 /flags：列出所有的gflags
 
@@ -113,7 +113,7 @@ r31658之后支持可视化地修改，在浏览器上访问时将看到(R)下�
 
 ```c++
 DEFINE_bool(hex_log_id, false, "Show log_id in hexadecimal");
-BAIDU_RPC_VALIDATE_GFLAG(hex_log_id, brpc::PassValidate/*always true*/);
+BRPC_VALIDATE_GFLAG(hex_log_id, brpc::PassValidate/*always true*/);
 ```
 
 这个flag是单纯的开关，修改后不需要更新其他数据（没有处理逻辑），代码中前面看到true后面看到false也不会产生什么后果（不需要线程同步），所以我们让其默认可重载。
@@ -122,13 +122,13 @@ BAIDU_RPC_VALIDATE_GFLAG(hex_log_id, brpc::PassValidate/*always true*/);
 
 ```c++
 DEFINE_int32(health_check_interval, 3, "seconds between consecutive health-checkings");
-BAIDU_RPC_VALIDATE_GFLAG(health_check_interval, brpc::PositiveInteger);
+BRPC_VALIDATE_GFLAG(health_check_interval, brpc::PositiveInteger);
 ```
 
 以上操作都可以在命令行中进行：
 
 ```shell
-$ curl brpc.baidu.com:8765/flags/health_check_interval
+$ curl localhost:8765/flags/health_check_interval
 Name | Value | Description | Defined At
 ---------------------------------------
 health_check_interval (R) | 3 | seconds between consecutive health-checkings | src/brpc/socket_map.cpp

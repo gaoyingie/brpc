@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_MEMORY_REF_COUNTED_H_
-#define BASE_MEMORY_REF_COUNTED_H_
+#ifndef BUTIL_MEMORY_REF_COUNTED_H_
+#define BUTIL_MEMORY_REF_COUNTED_H_
 
 #include <cassert>
 
@@ -19,7 +19,7 @@ namespace butil {
 
 namespace subtle {
 
-class BASE_EXPORT RefCountedBase {
+class BUTIL_EXPORT RefCountedBase {
  public:
   bool HasOneRef() const { return ref_count_ == 1; }
 
@@ -78,7 +78,7 @@ class BASE_EXPORT RefCountedBase {
   DISALLOW_COPY_AND_ASSIGN(RefCountedBase);
 };
 
-class BASE_EXPORT RefCountedThreadSafeBase {
+class BUTIL_EXPORT RefCountedThreadSafeBase {
  public:
   bool HasOneRef() const;
 
@@ -137,7 +137,7 @@ class RefCounted : public subtle::RefCountedBase {
   ~RefCounted() {}
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(RefCounted<T>);
+  DISALLOW_COPY_AND_ASSIGN(RefCounted);
 };
 
 // Forward declaration.
@@ -232,7 +232,7 @@ class RefCountedData
 //   void some_other_function() {
 //     scoped_refptr<MyFoo> foo = new MyFoo();
 //     ...
-//     foo = NULL;  // explicitly releases |foo|
+//     foo = nullptr;  // explicitly releases |foo|
 //     ...
 //     if (foo)
 //       foo->Method(param);
@@ -247,7 +247,7 @@ class RefCountedData
 //     scoped_refptr<MyFoo> b;
 //
 //     b.swap(a);
-//     // now, |b| references the MyFoo object, and |a| references NULL.
+//     // now, |b| references the MyFoo object, and |a| references nullptr.
 //   }
 //
 // To make both |a| and |b| in the above example reference the same MyFoo
@@ -266,7 +266,7 @@ class scoped_refptr {
  public:
   typedef T element_type;
 
-  scoped_refptr() : ptr_(NULL) {
+  scoped_refptr() : ptr_(nullptr) {
   }
 
   scoped_refptr(T* p) : ptr_(p) {
@@ -285,6 +285,17 @@ class scoped_refptr {
       ptr_->AddRef();
   }
 
+  scoped_refptr(scoped_refptr<T>&& r) noexcept {
+    ptr_ = r.ptr_;
+    r.ptr_ = nullptr;
+  }
+
+  template <typename U>
+  scoped_refptr(scoped_refptr<U>&& r) noexcept {
+    ptr_ = r.ptr_;
+    r.ptr_ = nullptr;
+  }
+
   ~scoped_refptr() {
     if (ptr_)
       ptr_->Release();
@@ -297,7 +308,7 @@ class scoped_refptr {
   operator T*() const { return ptr_; }
 
   T* operator->() const {
-    assert(ptr_ != NULL);
+    assert(ptr_ != nullptr);
     return ptr_;
   }
 
@@ -333,7 +344,7 @@ class scoped_refptr {
 
   // Release ownership of ptr_, keeping its reference counter unchanged.
   T* release() WARN_UNUSED_RESULT {
-      T* saved_ptr = NULL;
+      T* saved_ptr = nullptr;
       swap(&saved_ptr);
       return saved_ptr;
   }
@@ -349,4 +360,4 @@ scoped_refptr<T> make_scoped_refptr(T* t) {
   return scoped_refptr<T>(t);
 }
 
-#endif  // BASE_MEMORY_REF_COUNTED_H_
+#endif  // BUTIL_MEMORY_REF_COUNTED_H_

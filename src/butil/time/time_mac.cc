@@ -15,7 +15,6 @@
 
 #include "butil/basictypes.h"
 #include "butil/logging.h"
-#include "butil/mac/mach_logging.h"
 #include "butil/mac/scoped_cftyperef.h"
 #include "butil/mac/scoped_mach_port.h"
 
@@ -30,7 +29,7 @@ uint64_t ComputeCurrentTicks() {
   struct timeval boottime;
   int mib[2] = {CTL_KERN, KERN_BOOTTIME};
   size_t size = sizeof(boottime);
-  int kr = sysctl(mib, arraysize(mib), &boottime, &size, NULL, 0);
+  int kr = sysctl(mib, arraysize(mib), &boottime, &size, nullptr, 0);
   DCHECK_EQ(KERN_SUCCESS, kr);
   butil::TimeDelta time_difference = butil::Time::Now() -
       (butil::Time::FromTimeT(boottime.tv_sec) +
@@ -47,7 +46,7 @@ uint64_t ComputeCurrentTicks() {
     // whether mach_timebase_info has already been called.  This is
     // recommended by Apple's QA1398.
     kern_return_t kr = mach_timebase_info(&timebase_info);
-    MACH_DCHECK(kr == KERN_SUCCESS, kr) << "mach_timebase_info";
+    DCHECK(kr == KERN_SUCCESS) << "Fail to call mach_timebase_info";
   }
 
   // mach_absolute_time is it when it comes to ticks on the Mac.  Other calls
@@ -82,11 +81,11 @@ uint64_t ComputeThreadTicks() {
   }
 
   kern_return_t kr = thread_info(
-      thread,
+      thread.get(),
       THREAD_BASIC_INFO,
       reinterpret_cast<thread_info_t>(&thread_info_data),
       &thread_info_count);
-  MACH_DCHECK(kr == KERN_SUCCESS, kr) << "thread_info";
+  DCHECK(kr == KERN_SUCCESS) << "Fail to call thread_info";
 
   return (thread_info_data.user_time.seconds *
               butil::Time::kMicrosecondsPerSecond) +
@@ -172,7 +171,7 @@ Time Time::FromExploded(bool is_local, const Exploded& exploded) {
   date.year = exploded.year;
 
   butil::ScopedCFTypeRef<CFTimeZoneRef> time_zone(
-      is_local ? CFTimeZoneCopySystem() : NULL);
+      is_local ? CFTimeZoneCopySystem() : nullptr);
   CFAbsoluteTime seconds = CFGregorianDateGetAbsoluteTime(date, time_zone) +
       kCFAbsoluteTimeIntervalSince1970;
   return Time(static_cast<int64_t>(seconds * kMicrosecondsPerSecond) +
@@ -190,7 +189,7 @@ void Time::Explode(bool is_local, Exploded* exploded) const {
                            kCFAbsoluteTimeIntervalSince1970;
 
   butil::ScopedCFTypeRef<CFTimeZoneRef> time_zone(
-      is_local ? CFTimeZoneCopySystem() : NULL);
+      is_local ? CFTimeZoneCopySystem() : nullptr);
   CFGregorianDate date = CFAbsoluteTimeGetGregorianDate(seconds, time_zone);
   // 1 = Monday, ..., 7 = Sunday.
   int cf_day_of_week = CFAbsoluteTimeGetDayOfWeek(seconds, time_zone);

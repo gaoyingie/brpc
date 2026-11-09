@@ -1,25 +1,27 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Zhangyi Chen(chenzhangyi01@baidu.com)
 
 #include <stdio.h>                                  // snprintf
 
 #include "butil/logging.h"                           // BAIDU_*
 #include "butil/macros.h"                            // ARRAY_SIZE
 #include "butil/thread_local.h"                      // thread_local
-
+#include "brpc/errno.pb.h"
 #include "brpc/http_status_code.h"
 
 
@@ -98,19 +100,46 @@ static void InitReasonPhrases() {
     }
 }
 
-static BAIDU_THREAD_LOCAL char tls_phrase_cache[64];
+using PhraseCache = char[64];
+static BUTIL_THREAD_LOCAL(PhraseCache, tls_phrase_cache, {});
 
 const char *HttpReasonPhrase(int status_code) {
     pthread_once(&init_reason_phrases_once, InitReasonPhrases);
-    const char* desc = NULL;
+    const char* desc = nullptr;
     if (status_code >= 0 &&
         status_code < (int)ARRAY_SIZE(phrases) &&
         (desc = phrases[status_code])) {
         return desc;
     }
-    snprintf(tls_phrase_cache, sizeof(tls_phrase_cache),
+    snprintf(tls_phrase_cache(), sizeof(tls_phrase_cache()),
              "Unknown status code (%d)", status_code);
-    return tls_phrase_cache;
+    return tls_phrase_cache();
+}
+
+int ErrorCodeToStatusCode(int error_code) {
+    if (error_code == 0) {
+        return HTTP_STATUS_OK;
+    }
+    switch (error_code) {
+    case ENOSERVICE:
+    case ENOMETHOD:
+        return HTTP_STATUS_NOT_FOUND;
+    case ERPCAUTH:
+        return HTTP_STATUS_UNAUTHORIZED;
+    case EREQUEST:
+    case EINVAL:
+        return HTTP_STATUS_BAD_REQUEST;
+    case ELIMIT:
+    case ELOGOFF:
+        return HTTP_STATUS_SERVICE_UNAVAILABLE;
+    case EPERM:
+        return HTTP_STATUS_FORBIDDEN;
+    case ERPCTIMEDOUT:
+    case ETIMEDOUT:
+        return HTTP_STATUS_GATEWAY_TIMEOUT;
+    default:
+        return HTTP_STATUS_INTERNAL_SERVER_ERROR;
+    }
 }
 
 } // namespace brpc

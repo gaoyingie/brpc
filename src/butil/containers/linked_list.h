@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_CONTAINERS_LINKED_LIST_H_
-#define BASE_CONTAINERS_LINKED_LIST_H_
+#ifndef BUTIL_CONTAINERS_LINKED_LIST_H_
+#define BUTIL_CONTAINERS_LINKED_LIST_H_
 
 #include "butil/macros.h"
 
@@ -30,7 +30,7 @@
 //
 //   list.Append(n1);
 //   list.Append(n3);
-//   n3->InsertBefore(n3);
+//   n2->InsertBefore(n3);
 //
 // Lastly, to iterate through the linked list forwards:
 //
@@ -128,7 +128,7 @@ class LinkNode {
   void RemoveFromList() {
     this->previous_->next_ = this->next_;
     this->next_->previous_ = this->previous_;
-    // next() and previous() return non-NULL if and only this node is not in any
+    // next() and previous() return non-nullptr if and only this node is not in any
     // list.
     this->next_ = this;
     this->previous_ = this;
@@ -171,6 +171,11 @@ class LinkedList {
     e->InsertBefore(&root_);
   }
 
+  // Prepend |e| to the head of the linked list.
+  void Prepend(LinkNode<T>* e) {
+    e->InsertAfter(&root_);
+  }
+
   LinkNode<T>* head() const {
     return root_.next();
   }
@@ -193,4 +198,4 @@ class LinkedList {
 
 }  // namespace butil
 
-#endif  // BASE_CONTAINERS_LINKED_LIST_H_
+#endif  // BUTIL_CONTAINERS_LINKED_LIST_H_

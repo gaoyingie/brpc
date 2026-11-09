@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_NSHEAD_SERVICE_H
 #define BRPC_NSHEAD_SERVICE_H
@@ -20,11 +22,10 @@
 #include "brpc/controller.h"                 // Controller
 #include "brpc/nshead_message.h"             // NsheadMessage
 #include "brpc/describable.h"
-
+#include "brpc/adaptive_max_concurrency.h"
 
 namespace brpc {
 
-class Socket;
 class Server;
 class MethodStatus;
 class StatusService;
@@ -39,18 +40,17 @@ public:
     explicit NsheadClosure(void* additional_space);
 
     // [Required] Call this to send response back to the client.
-    void Run();
+    void Run() override;
 
     // [Optional] Set the full method name. If unset, use name of the service.
     void SetMethodName(const std::string& full_method_name);
     
     // The space required by subclass at NsheadServiceOptions. subclass may
     // utilizes this feature to save the cost of allocating closure separately.
-    // If subclass does not require space, this return value is NULL.
+    // If subclass does not require space, this return value is nullptr.
     void* additional_space() { return _additional_space; }
 
-    // The starting time of the RPC, got from butil::cpuwide_time_us().
-    int64_t cpuwide_start_us() const { return _start_parse_us; }
+    int64_t received_us() const { return _received_us; }
 
     // Don't send response back, used by MIMO.
     void DoNotRespond();
@@ -59,11 +59,10 @@ private:
 friend void policy::ProcessNsheadRequest(InputMessageBase* msg_base);
 friend class DeleteNsheadClosure;
     // Only callable by Run().
-    ~NsheadClosure();
+    ~NsheadClosure() override;
 
-    Socket* _socket_ptr;
     const Server* _server;
-    int64_t _start_parse_us;
+    int64_t _received_us;
     NsheadMessage _request;
     NsheadMessage _response;
     bool _do_respond;
@@ -85,8 +84,8 @@ struct NsheadServiceOptions {
 class NsheadService : public Describable {
 public:
     NsheadService();
-    NsheadService(const NsheadServiceOptions&);
-    virtual ~NsheadService();
+    explicit NsheadService(const NsheadServiceOptions&);
+    ~NsheadService() override;
 
     // Implement this method to handle nshead requests. Notice that this
     // method can be called with a failed Controller(something wrong with the
@@ -105,7 +104,7 @@ public:
                                       NsheadClosure* done) = 0;
 
     // Put descriptions into the stream.
-    void Describe(std::ostream &os, const DescribeOptions&) const;
+    void Describe(std::ostream &os, const DescribeOptions&) const override;
 
 private:
 DISALLOW_COPY_AND_ASSIGN(NsheadService);
@@ -119,6 +118,7 @@ private:
     
     // Tracking status of non NsheadPbService
     MethodStatus* _status;
+    AdaptiveMaxConcurrency _max_concurrency;
     size_t _additional_space;
     std::string _cached_name;
 };

@@ -16,15 +16,14 @@
 // and ideally a leaf dependency. Singletons get problematic when they attempt
 // to do too much in their destructor or have circular dependencies.
 
-#ifndef BASE_MEMORY_SINGLETON_H_
-#define BASE_MEMORY_SINGLETON_H_
+#ifndef BUTIL_MEMORY_SINGLETON_H_
+#define BUTIL_MEMORY_SINGLETON_H_
 
 #include "butil/at_exit.h"
 #include "butil/atomicops.h"
 #include "butil/base_export.h"
 #include "butil/memory/aligned_memory.h"
 #include "butil/third_party/dynamic_annotations/dynamic_annotations.h"
-#include "butil/threading/thread_restrictions.h"
 
 namespace butil {
 namespace internal {
@@ -35,7 +34,7 @@ static const subtle::AtomicWord kBeingCreatedMarker = 1;
 
 // We pull out some of the functionality into a non-templated function, so that
 // we can implement the more complicated pieces out of line in the .cc file.
-BASE_EXPORT subtle::AtomicWord WaitForInstance(subtle::AtomicWord* instance);
+BUTIL_EXPORT subtle::AtomicWord WaitForInstance(subtle::AtomicWord* instance);
 
 }  // namespace internal
 }  // namespace butil
@@ -122,17 +121,17 @@ const bool LeakySingletonTraits<Type>::kAllowedToAccessOnNonjoinableThread = tru
 template <typename Type>
 struct StaticMemorySingletonTraits {
   // WARNING: User has to deal with get() in the singleton class
-  // this is traits for returning NULL.
+  // this is traits for returning nullptr.
   static Type* New() {
-    // Only constructs once and returns pointer; otherwise returns NULL.
+    // Only constructs once and returns pointer; otherwise returns nullptr.
     if (butil::subtle::NoBarrier_AtomicExchange(&dead_, 1))
-      return NULL;
+      return nullptr;
 
     return new(buffer_.void_data()) Type();
   }
 
   static void Delete(Type* p) {
-    if (p != NULL)
+    if (p != nullptr)
       p->Type::~Type();
   }
 
@@ -253,7 +252,7 @@ class Singleton {
     // Object isn't created yet, maybe we will get to create it, let's try...
     if (butil::subtle::Acquire_CompareAndSwap(
           &instance_, 0, butil::internal::kBeingCreatedMarker) == 0) {
-      // instance_ was NULL and is now kBeingCreatedMarker.  Only one thread
+      // instance_ was nullptr and is now kBeingCreatedMarker.  Only one thread
       // will ever get here.  Threads might be spinning on us, and they will
       // stop right after we do this store.
       Type* newval = Traits::New();
@@ -266,8 +265,9 @@ class Singleton {
       butil::subtle::Release_Store(
           &instance_, reinterpret_cast<butil::subtle::AtomicWord>(newval));
 
-      if (newval != NULL && Traits::kRegisterAtExit)
-        butil::AtExitManager::RegisterCallback(OnExit, NULL);
+      if (newval != nullptr && Traits::kRegisterAtExit) {
+        butil::AtExitManager::RegisterCallback(OnExit, nullptr);
+      }
 
       return newval;
     }
@@ -297,4 +297,4 @@ template <typename Type, typename Traits, typename DifferentiatingType>
 butil::subtle::AtomicWord Singleton<Type, Traits, DifferentiatingType>::
     instance_ = 0;
 
-#endif  // BASE_MEMORY_SINGLETON_H_
+#endif  // BUTIL_MEMORY_SINGLETON_H_

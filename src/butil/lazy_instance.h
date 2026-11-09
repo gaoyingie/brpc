@@ -32,14 +32,13 @@
 //     ptr->DoDoDo();  // MyClass::DoDoDo
 //   }
 
-#ifndef BASE_LAZY_INSTANCE_H_
-#define BASE_LAZY_INSTANCE_H_
+#ifndef BUTIL_LAZY_INSTANCE_H_
+#define BUTIL_LAZY_INSTANCE_H_
 
 #include <new>  // For placement new.
 
 #include "butil/atomicops.h"
 #include "butil/base_export.h"
-#include "butil/basictypes.h"
 #include "butil/debug/leak_annotations.h"
 #include "butil/logging.h"
 #include "butil/memory/aligned_memory.h"
@@ -105,6 +104,7 @@ struct LeakyLazyInstanceTraits {
 #endif
 
   static Type* New(void* instance) {
+    // Instruct LeakSanitizer to ignore the designated memory leak.
     ANNOTATE_SCOPED_MEMORY_LEAK;
     return DefaultLazyInstanceTraits<Type>::New(instance);
   }
@@ -126,11 +126,11 @@ static const subtle::AtomicWord kLazyInstanceStateCreating = 1;
 // Check if instance needs to be created. If so return true otherwise
 // if another thread has beat us, wait for instance to be created and
 // return false.
-BASE_EXPORT bool NeedsLazyInstance(subtle::AtomicWord* state);
+BUTIL_EXPORT bool NeedsLazyInstance(subtle::AtomicWord* state);
 
 // After creating an instance, call this to register the dtor to be called
 // at program exit and to update the atomic state to hold the |new_instance|
-BASE_EXPORT void CompleteLazyInstance(subtle::AtomicWord* state,
+BUTIL_EXPORT void CompleteLazyInstance(subtle::AtomicWord* state,
                                       subtle::AtomicWord new_instance,
                                       void* lazy_instance,
                                       void (*dtor)(void*));
@@ -180,7 +180,7 @@ class LazyInstance {
       value = reinterpret_cast<subtle::AtomicWord>(
           Traits::New(private_buf_.void_data()));
       internal::CompleteLazyInstance(&private_instance_, value, this,
-                                     Traits::kRegisterOnExit ? OnExit : NULL);
+                                     Traits::kRegisterOnExit ? OnExit : nullptr);
     }
 
     // This annotation helps race detectors recognize correct lock-less
@@ -195,7 +195,7 @@ class LazyInstance {
   bool operator==(Type* p) {
     switch (subtle::NoBarrier_Load(&private_instance_)) {
       case 0:
-        return p == NULL;
+        return p == nullptr;
       case internal::kLazyInstanceStateCreating:
         return static_cast<void*>(p) == private_buf_.void_data();
       default:
@@ -229,4 +229,4 @@ class LazyInstance {
 
 }  // namespace butil
 
-#endif  // BASE_LAZY_INSTANCE_H_
+#endif  // BUTIL_LAZY_INSTANCE_H_

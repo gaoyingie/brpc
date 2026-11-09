@@ -12,11 +12,11 @@
 
 ![img](../images/normal_worker_usage.png)
 
-把 /vars/bthread_worker_count;bthread_worker_usage?expand 拼在服务url后直接看到这两幅图，就像[这样](http://brpc.baidu.com:8765/vars/bthread_worker_count;bthread_worker_usage?expand)。
+把 /vars/bthread_worker_count;bthread_worker_usage?expand 拼在服务url后直接看到这两幅图，就像[这样](http://localhost:8765/vars/bthread_worker_count;bthread_worker_usage?expand)。
 
 # 2.检查CPU的使用程度
 
-查看 /vars/process_core_**count** 和 /vars/process_cpu_**usage**。分别是cpu核心的个数，和正在使用的cpu核数。
+查看 /vars/system_core_**count** 和 /vars/process_cpu_**usage**。分别是cpu核心的个数，和正在使用的cpu核数。
 
 > 如果usage和count接近，说明CPU不够用了。
 
@@ -42,14 +42,14 @@
 
 ### 排除上游分流不均的嫌疑
 
-在不同服务的[vars界面](http://brpc.baidu.com:8765/vars)输入qps，查看不同的qps是否符合预期，就像这样：
+在不同服务的[vars界面](http://localhost:8765/vars)输入qps，查看不同的qps是否符合预期，就像这样：
 
 ![img](../images/bthread_creation_qps.png)
 
 或者在命令行中用curl直接访问，像这样：
 
 ```shell
-$ curl brpc.baidu.com:8765/vars/*qps*
+$ curl localhost:8765/vars/*qps*
 bthread_creation_qps : 95
 rpc_server_8765_example_echo_service_echo_qps : 57
 ```
@@ -80,11 +80,9 @@ rpc_server_8765_example_echo_service_echo_qps : 57
 
 ![img](../images/bthread_concurrency_2.png)
 
-回到flags界面可以看到bthread_concurrency已变成了新值。
+回到/flags界面可以看到bthread_concurrency已变成了新值。
 
 ![img](../images/bthread_concurrency_3.png)
-
- 
 
 不过，调大线程数未必有用。如果工作线程是由于访问下游而大量阻塞，调大工作线程数是没有用的。因为真正的瓶颈在于后端的，调大线程后只是让每个线程的阻塞时间变得更长。
 

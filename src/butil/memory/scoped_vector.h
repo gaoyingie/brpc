@@ -2,22 +2,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_MEMORY_SCOPED_VECTOR_H_
-#define BASE_MEMORY_SCOPED_VECTOR_H_
+#ifndef BUTIL_MEMORY_SCOPED_VECTOR_H_
+#define BUTIL_MEMORY_SCOPED_VECTOR_H_
 
+#include <utility>
 #include <vector>
 
 #include "butil/basictypes.h"
 #include "butil/logging.h"
-#include "butil/move.h"
 #include "butil/stl_util.h"
+
+namespace butil {
 
 // ScopedVector wraps a vector deleting the elements from its
 // destructor.
 template <class T>
 class ScopedVector {
-  MOVE_ONLY_TYPE_FOR_CPP_03(ScopedVector, RValue)
-
  public:
   typedef typename std::vector<T*>::allocator_type allocator_type;
   typedef typename std::vector<T*>::size_type size_type;
@@ -35,10 +35,15 @@ class ScopedVector {
 
   ScopedVector() {}
   ~ScopedVector() { clear(); }
-  ScopedVector(RValue other) { swap(*other.object); }
+  DISALLOW_COPY_AND_ASSIGN(ScopedVector);
+  ScopedVector(ScopedVector&& other) noexcept { swap(other); }
+  ScopedVector(std::initializer_list<value_type> il) : v_(il) {}
 
-  ScopedVector& operator=(RValue rhs) {
-    swap(*rhs.object);
+  ScopedVector& operator=(ScopedVector&& rhs) {
+    if (this != &rhs) {
+      ScopedVector tmp(std::move(rhs));
+      swap(tmp);
+    }
     return *this;
   }
 
@@ -134,4 +139,6 @@ class ScopedVector {
   std::vector<T*> v_;
 };
 
-#endif  // BASE_MEMORY_SCOPED_VECTOR_H_
+} // namespace butil
+
+#endif  // BUTIL_MEMORY_SCOPED_VECTOR_H_

@@ -1,4 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <vector>
 #include <map>
@@ -9,30 +24,58 @@
 #include <typeinfo>
 #include <limits> 
 #include <google/protobuf/descriptor.h>
-#include "json_to_pb.h"
-#include "zero_copy_stream_reader.h"       // ZeroCopyStreamReader
-#include "encode_decode.h"
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <gflags/gflags.h>
+#include "butil/strings/string_number_conversions.h"
+#include "butil/strings/string_util.h"
+#include "butil/third_party/rapidjson/error/error.h"
+#include "butil/third_party/rapidjson/rapidjson.h"
+#include "json2pb/json_to_pb.h"
+#include "json2pb/zero_copy_stream_reader.h"       // ZeroCopyStreamReader
+#include "json2pb/encode_decode.h"
+#include "json2pb/protobuf_map.h"
+#include "json2pb/rapidjson.h"
+#include "json2pb/protobuf_type_resolver.h"
 #include "butil/base64.h"
-#include "butil/string_printf.h"
-#include "protobuf_map.h"
-#include "rapidjson.h"
+#include "butil/iobuf.h"
 
-#define J2PERROR(perr, fmt, ...)                                        \
+#ifdef __GNUC__
+// Ignore -Wnonnull for `(::google::protobuf::Message*)nullptr' of J2PERROR by design.
+#pragma GCC diagnostic ignored "-Wnonnull"
+#endif
+
+#define J2PERROR(perr, fmt, ...)                                    \
+    J2PERROR_WITH_PB((::google::protobuf::Message*)nullptr, perr, fmt, ##__VA_ARGS__)
+
+#define J2PERROR_WITH_PB(pb, perr, fmt, ...)                            \
     if (perr) {                                                         \
         if (!perr->empty()) {                                           \
             perr->append(", ", 2);                                      \
         }                                                               \
-        butil::string_appendf(perr, fmt, ##__VA_ARGS__);                 \
+        butil::string_appendf(perr, fmt, ##__VA_ARGS__);                \
+        if ((pb) != nullptr) {                                          \
+            butil::string_appendf(perr, " [%s]",                        \
+                    butil::EnsureString((pb)->GetDescriptor()->name()).c_str()); \
+        }                                                               \
     } else { }
 
 namespace json2pb {
 
+// Use iterative parsing to avoid stack overflow.
+const int RAPIDJSON_PARSE_FLAG_DEFAULT = BUTIL_RAPIDJSON_NAMESPACE::kParseIterativeFlag;
+const int RAPIDJSON_PARSE_FLAG_STOP_WHEN_DONE = BUTIL_RAPIDJSON_NAMESPACE::kParseStopWhenDoneFlag | RAPIDJSON_PARSE_FLAG_DEFAULT;
+
+DEFINE_int32(json2pb_max_recursion_depth, 100, "Maximum recursion depth of JSON parser");
+
 Json2PbOptions::Json2PbOptions()
 #ifdef BAIDU_INTERNAL
-    : base64_to_bytes(false) {
+    : base64_to_bytes(false)
 #else
-    : base64_to_bytes(true) {
+    : base64_to_bytes(true)
 #endif
+    , array_to_single_repeated(false)
+    , allow_remaining_bytes_after_parsing(false) {
 }
 
 enum MatchType { 
@@ -41,7 +84,7 @@ enum MatchType {
     OPTIONAL_TYPE_MISMATCH = 0x02 
 };
  
-static void string_append_value(const rapidjson::Value& value,
+static void string_append_value(const BUTIL_RAPIDJSON_NAMESPACE::Value& value,
                                 std::string* output) {
     if (value.IsNull()) {
         output->append("null");
@@ -52,9 +95,9 @@ static void string_append_value(const rapidjson::Value& value,
     } else if (value.IsUint()) {
         butil::string_appendf(output, "%u", value.GetUint());
     } else if (value.IsInt64()) {
-        butil::string_appendf(output, "%ld", value.GetInt64());
+        butil::string_appendf(output, "%" PRId64, value.GetInt64());
     } else if (value.IsUint64()) {
-        butil::string_appendf(output, "%lu", value.GetUint64());
+        butil::string_appendf(output, "%" PRIu64, value.GetUint64());
     } else if (value.IsDouble()) {
         butil::string_appendf(output, "%f", value.GetDouble());
     } else if (value.IsString()) {
@@ -75,8 +118,8 @@ static void string_append_value(const rapidjson::Value& value,
 //and ends with ',' and return true.
 //otherwise will append error into error message and return false.
 inline bool value_invalid(const google::protobuf::FieldDescriptor* field, const char* type,
-                          const rapidjson::Value& value, std::string* err) {
-    bool optional = field->is_optional();
+                          const BUTIL_RAPIDJSON_NAMESPACE::Value& value, std::string* err) {
+    bool optional = !field->is_required() && !field->is_repeated();
     if (err) {
         if (!err->empty()) {
             err->append(", ");
@@ -85,7 +128,7 @@ inline bool value_invalid(const google::protobuf::FieldDescriptor* field, const 
         string_append_value(value, err);
         butil::string_appendf(err, "' for %sfield `%s' which SHOULD be %s",
                        optional ? "optional " : "",
-                       field->full_name().c_str(), type);
+                       butil::EnsureString(field->full_name()).c_str(), type);
     }
     if (!optional) {
         return false;                                           
@@ -101,7 +144,7 @@ inline bool convert_string_to_double_float_type(
     google::protobuf::Message* message,
     const google::protobuf::FieldDescriptor* field, 
     const google::protobuf::Reflection* reflection,
-    const rapidjson::Value& item,
+    const BUTIL_RAPIDJSON_NAMESPACE::Value& item,
     std::string* err) {
     const char* limit_type = item.GetString();  // MUST be string here 
     if (std::numeric_limits<T>::has_quiet_NaN &&
@@ -122,7 +165,7 @@ inline bool convert_string_to_double_float_type(
     return value_invalid(field, typeid(T).name(), item, err);
 }
 
-inline bool convert_float_type(const rapidjson::Value& item, bool repeated,
+inline bool convert_float_type(const BUTIL_RAPIDJSON_NAMESPACE::Value& item, bool repeated,
                                google::protobuf::Message* message,
                                const google::protobuf::FieldDescriptor* field, 
                                const google::protobuf::Reflection* reflection,
@@ -146,7 +189,7 @@ inline bool convert_float_type(const rapidjson::Value& item, bool repeated,
     return true;
 }
 
-inline bool convert_double_type(const rapidjson::Value& item, bool repeated,
+inline bool convert_double_type(const BUTIL_RAPIDJSON_NAMESPACE::Value& item, bool repeated,
                                 google::protobuf::Message* message,
                                 const google::protobuf::FieldDescriptor* field, 
                                 const google::protobuf::Reflection* reflection,
@@ -170,12 +213,12 @@ inline bool convert_double_type(const rapidjson::Value& item, bool repeated,
     return true;
 }
 
-inline bool convert_enum_type(const rapidjson::Value&item, bool repeated,
+inline bool convert_enum_type(const BUTIL_RAPIDJSON_NAMESPACE::Value&item, bool repeated,
                               google::protobuf::Message* message,
                               const google::protobuf::FieldDescriptor* field,
                               const google::protobuf::Reflection* reflection,
                               std::string* err) {
-    const google::protobuf::EnumValueDescriptor * enum_value_descriptor = NULL; 
+    const google::protobuf::EnumValueDescriptor * enum_value_descriptor = nullptr; 
     if (item.IsInt()) {
         enum_value_descriptor = field->enum_type()->FindValueByNumber(item.GetInt()); 
     } else if (item.IsString()) {                                          
@@ -192,11 +235,65 @@ inline bool convert_enum_type(const rapidjson::Value&item, bool repeated,
     return true;
 }
 
-bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
+inline bool convert_int64_type(const BUTIL_RAPIDJSON_NAMESPACE::Value& item, bool repeated,
+                               google::protobuf::Message* message,
+                               const google::protobuf::FieldDescriptor* field, 
+                               const google::protobuf::Reflection* reflection,
+                               std::string* err) { 
+  
+    int64_t num;
+    if (item.IsInt64()) {
+        if (repeated) {
+            reflection->AddInt64(message, field, item.GetInt64());
+        } else {
+            reflection->SetInt64(message, field, item.GetInt64());
+        }
+    } else if (item.IsString() &&
+               butil::StringToInt64({item.GetString(), item.GetStringLength()},
+                                    &num)) {
+        if (repeated) {
+            reflection->AddInt64(message, field, num);
+        } else {
+            reflection->SetInt64(message, field, num);
+        }
+    } else {
+        return value_invalid(field, "INT64", item, err);
+    }
+    return true;
+}
+
+inline bool convert_uint64_type(const BUTIL_RAPIDJSON_NAMESPACE::Value& item,
+                                bool repeated,
+                                google::protobuf::Message* message,
+                                const google::protobuf::FieldDescriptor* field,
+                                const google::protobuf::Reflection* reflection,
+                                std::string* err) {
+    uint64_t num;
+    if (item.IsUint64()) {
+        if (repeated) {
+            reflection->AddUInt64(message, field, item.GetUint64());
+        } else {
+            reflection->SetUInt64(message, field, item.GetUint64());
+        }
+    } else if (item.IsString() &&
+               butil::StringToUint64({item.GetString(), item.GetStringLength()},
+                                     &num)) {
+        if (repeated) {
+            reflection->AddUInt64(message, field, num);
+        } else {
+            reflection->SetUInt64(message, field, num);
+        }
+    } else {
+        return value_invalid(field, "UINT64", item, err);
+    }
+    return true;
+}
+
+bool JsonValueToProtoMessage(const BUTIL_RAPIDJSON_NAMESPACE::Value& json_value,
                              google::protobuf::Message* message,
                              const Json2PbOptions& options,
-                             std::string* err);
-
+                             std::string* err,
+                             int depth);
 //Json value to protobuf convert rules for type:
 //Json value type                 Protobuf type                convert rules
 //int                             int uint int64 uint64        valid convert is available
@@ -204,9 +301,10 @@ bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
 //int64                           int uint int64 uint64        valid convert is available
 //uint64                          int uint int64 uint64        valid convert is available
 //int uint int64 uint64           float double                 available
-//"NaN" "Infinity" "-Infinity"    float double                 only "NaN" "Infinity" "-Infinity" is available    
+//"NaN" "Infinity" "-Infinity"    float double                 only "NaN" "Infinity" "-Infinity" is available
 //int                             enum                         valid enum number value is available
-//string                          enum                         valid enum name value is available         
+//string                          enum                         valid enum name value is available
+//string                          int64 uint64                 valid convert is available
 //other mismatch type convertion will be regarded as error.
 #define J2PCHECKTYPE(value, cpptype, jsontype) ({                   \
             MatchType match_type = TYPE_MATCH;                      \
@@ -219,14 +317,16 @@ bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
             match_type;                                             \
         })
 
-static bool JsonValueToProtoField(const rapidjson::Value& value,
+
+static bool JsonValueToProtoField(const BUTIL_RAPIDJSON_NAMESPACE::Value& value,
                                   const google::protobuf::FieldDescriptor* field,
                                   google::protobuf::Message* message,
                                   const Json2PbOptions& options,
-                                  std::string* err) {
+                                  std::string* err,
+                                  int depth) {
     if (value.IsNull()) {
         if (field->is_required()) {
-            J2PERROR(err, "Missing required field: %s", field->full_name().c_str());
+            J2PERROR(err, "Missing required field: %s", butil::EnsureString(field->full_name()).c_str());
             return false;
         }
         return true;
@@ -235,7 +335,7 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
     if (field->is_repeated()) {
         if (!value.IsArray()) {
             J2PERROR(err, "Invalid value for repeated field: %s",
-                     field->full_name().c_str());
+                     butil::EnsureString(field->full_name()).c_str());
             return false;
         }
     } 
@@ -245,9 +345,9 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
 #define CASE_FIELD_TYPE(cpptype, method, jsontype)                      \
         case google::protobuf::FieldDescriptor::CPPTYPE_##cpptype: {                      \
             if (field->is_repeated()) {                                 \
-                const rapidjson::SizeType size = value.Size();          \
-                for (rapidjson::SizeType index = 0; index < size; ++index) { \
-                    const rapidjson::Value & item = value[index];       \
+                const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();          \
+                for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) { \
+                    const BUTIL_RAPIDJSON_NAMESPACE::Value & item = value[index];       \
                     if (TYPE_MATCH == J2PCHECKTYPE(item, cpptype, jsontype)) { \
                         reflection->Add##method(message, field, item.Get##jsontype()); \
                     }                                                   \
@@ -256,19 +356,52 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
                 reflection->Set##method(message, field, value.Get##jsontype()); \
             }                                                           \
             break;                                                      \
-        }                                                           
+        }                                                               \
+          
         CASE_FIELD_TYPE(INT32,  Int32,  Int);
         CASE_FIELD_TYPE(UINT32, UInt32, Uint);
         CASE_FIELD_TYPE(BOOL,   Bool,   Bool);
-        CASE_FIELD_TYPE(INT64,  Int64,  Int64);
-        CASE_FIELD_TYPE(UINT64, UInt64, Uint64);
 #undef CASE_FIELD_TYPE
 
-    case google::protobuf::FieldDescriptor::CPPTYPE_FLOAT:  
+    case google::protobuf::FieldDescriptor::CPPTYPE_INT64:
         if (field->is_repeated()) {
-            const rapidjson::SizeType size = value.Size();
-            for (rapidjson::SizeType index = 0; index < size; ++index) {
-                const rapidjson::Value & item = value[index];
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size;
+                 ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value& item = value[index];
+                if (!convert_int64_type(item, true, message, field, reflection,
+                                        err)) {
+                    return false;
+                }
+            }
+        } else if (!convert_int64_type(value, false, message, field, reflection,
+                                       err)) {
+            return false;
+        }
+        break;
+
+    case google::protobuf::FieldDescriptor::CPPTYPE_UINT64:
+        if (field->is_repeated()) {
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size;
+                 ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value& item = value[index];
+                if (!convert_uint64_type(item, true, message, field, reflection,
+                                         err)) {
+                    return false;
+                }
+            }
+        } else if (!convert_uint64_type(value, false, message, field, reflection,
+                                       err)) {
+            return false;
+        }
+        break;
+
+    case google::protobuf::FieldDescriptor::CPPTYPE_FLOAT:
+        if (field->is_repeated()) {
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value & item = value[index];
                 if (!convert_float_type(item, true, message, field,
                                         reflection, err)) {
                     return false;
@@ -282,9 +415,9 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
 
     case google::protobuf::FieldDescriptor::CPPTYPE_DOUBLE: 
         if (field->is_repeated()) {
-            const rapidjson::SizeType size = value.Size();
-            for (rapidjson::SizeType index = 0; index < size; ++index) {
-                const rapidjson::Value & item = value[index];
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value & item = value[index];
                 if (!convert_double_type(item, true, message, field,
                                          reflection, err)) {
                     return false;
@@ -298,16 +431,16 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
         
     case google::protobuf::FieldDescriptor::CPPTYPE_STRING:
         if (field->is_repeated()) {
-            const rapidjson::SizeType size = value.Size();
-            for (rapidjson::SizeType index = 0; index < size; ++index) {
-                const rapidjson::Value & item = value[index];
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value & item = value[index];
                 if (TYPE_MATCH == J2PCHECKTYPE(item, string, String)) { 
                     std::string str(item.GetString(), item.GetStringLength());
                     if (field->type() == google::protobuf::FieldDescriptor::TYPE_BYTES &&
                         options.base64_to_bytes) {
                         std::string str_decoded;
                         if (!butil::Base64Decode(str, &str_decoded)) {
-                            J2PERROR(err, "Fail to decode base64 string=%s", str.c_str());
+                            J2PERROR_WITH_PB(message, err, "Fail to decode base64 string=%s", str.c_str());
                             return false;
                         }
                         str = str_decoded;
@@ -321,7 +454,7 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
                 options.base64_to_bytes) {
                 std::string str_decoded;
                 if (!butil::Base64Decode(str, &str_decoded)) {
-                    J2PERROR(err, "Fail to decode base64 string=%s", str.c_str());
+                    J2PERROR_WITH_PB(message, err, "Fail to decode base64 string=%s", str.c_str());
                     return false;
                 }
                 str = str_decoded;
@@ -332,9 +465,9 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
 
     case google::protobuf::FieldDescriptor::CPPTYPE_ENUM:
         if (field->is_repeated()) {
-            const rapidjson::SizeType size = value.Size();
-            for (rapidjson::SizeType index = 0; index < size; ++index) {
-                const rapidjson::Value & item = value[index];
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value & item = value[index];
                 if (!convert_enum_type(item, true, message, field,
                                        reflection, err)) {
                     return false;
@@ -348,18 +481,18 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
         
     case google::protobuf::FieldDescriptor::CPPTYPE_MESSAGE:
         if (field->is_repeated()) {
-            const rapidjson::SizeType size = value.Size();
-            for (rapidjson::SizeType index = 0; index < size; ++index) {
-                const rapidjson::Value& item = value[index];
+            const BUTIL_RAPIDJSON_NAMESPACE::SizeType size = value.Size();
+            for (BUTIL_RAPIDJSON_NAMESPACE::SizeType index = 0; index < size; ++index) {
+                const BUTIL_RAPIDJSON_NAMESPACE::Value& item = value[index];
                 if (TYPE_MATCH == J2PCHECKTYPE(item, message, Object)) { 
                     if (!JsonValueToProtoMessage(
-                            item, reflection->AddMessage(message, field), options, err)) {
+                            item, reflection->AddMessage(message, field), options, err, depth + 1)) {
                         return false;
                     }
                 } 
             }
         } else if (!JsonValueToProtoMessage(
-            value, reflection->MutableMessage(message, field), options, err)) {
+            value, reflection->MutableMessage(message, field), options, err, depth + 1)) {
             return false;
         }
         break;
@@ -367,14 +500,15 @@ static bool JsonValueToProtoField(const rapidjson::Value& value,
     return true;
 }
 
-bool JsonMapToProtoMap(const rapidjson::Value& value,
+bool JsonMapToProtoMap(const BUTIL_RAPIDJSON_NAMESPACE::Value& value,
                        const google::protobuf::FieldDescriptor* map_desc,
                        google::protobuf::Message* message,
                        const Json2PbOptions& options,
-                       std::string* err) {
+                       std::string* err,
+                       int depth) {
     if (!value.IsObject()) {
         J2PERROR(err, "Non-object value for map field: %s",
-                 map_desc->full_name().c_str());
+                 butil::EnsureString(map_desc->full_name()).c_str());
         return false;
     }
 
@@ -384,39 +518,49 @@ bool JsonMapToProtoMap(const rapidjson::Value& value,
     const google::protobuf::FieldDescriptor* value_desc =
             map_desc->message_type()->FindFieldByName(VALUE_NAME);
 
-    for (rapidjson::Value::ConstMemberIterator it =
+    for (BUTIL_RAPIDJSON_NAMESPACE::Value::ConstMemberIterator it =
                  value.MemberBegin(); it != value.MemberEnd(); ++it) {
         google::protobuf::Message* entry = reflection->AddMessage(message, map_desc);
         const google::protobuf::Reflection* entry_reflection = entry->GetReflection();
         entry_reflection->SetString(
             entry, key_desc, std::string(it->name.GetString(),
                                          it->name.GetStringLength()));
-        if (!JsonValueToProtoField(it->value, value_desc, entry, options, err)) {
+        if (!JsonValueToProtoField(it->value, value_desc, entry, options, err, depth + 1)) {
             return false;
         }
     }
     return true;
 }
 
-bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
+bool JsonValueToProtoMessage(const BUTIL_RAPIDJSON_NAMESPACE::Value& json_value,
                              google::protobuf::Message* message,
                              const Json2PbOptions& options,
-                             std::string* err) {
-    if (!json_value.IsObject()) {
-        J2PERROR(err, "`json_value' is not a json object");
+                             std::string* err,
+                             int depth) {
+    if (depth > FLAGS_json2pb_max_recursion_depth) {
+        J2PERROR_WITH_PB(message, err, "Exceeded maximum recursion depth");
+        return false;
+    }
+    const google::protobuf::Descriptor* descriptor = message->GetDescriptor();
+    if (!json_value.IsObject() &&
+        !(json_value.IsArray() && options.array_to_single_repeated && depth == 0)) {
+        J2PERROR_WITH_PB(message, err, "The input is not a json object");
         return false;
     }
 
     const google::protobuf::Reflection* reflection = message->GetReflection();
-    const google::protobuf::Descriptor* descriptor = message->GetDescriptor();
     
     std::vector<const google::protobuf::FieldDescriptor*> fields;
     fields.reserve(64);
     for (int i = 0; i < descriptor->extension_range_count(); ++i) {
         const google::protobuf::Descriptor::ExtensionRange*
             ext_range = descriptor->extension_range(i);
-        for (int tag_number = ext_range->start; tag_number < ext_range->end;
-             ++tag_number) {
+#if GOOGLE_PROTOBUF_VERSION < 4024000
+        for (int tag_number = ext_range->start; tag_number < ext_range->end; ++tag_number)
+#else
+        for (int tag_number = ext_range->start_number(); tag_number < ext_range->end_number(); ++tag_number)
+#endif
+        {
             const google::protobuf::FieldDescriptor* field =
                 reflection->FindKnownExtensionByNumber(tag_number);
             if (field) {
@@ -428,32 +572,41 @@ bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
         fields.push_back(descriptor->field(i));
     }
 
+    if (json_value.IsArray()) {
+        if (fields.size() == 1 && fields.front()->is_repeated()) {
+            return JsonValueToProtoField(json_value, fields.front(), message, options, err, depth);
+        }
+
+        J2PERROR_WITH_PB(message, err, "the input json can't be array here");
+        return false;
+    }
+
     std::string field_name_str_temp; 
-    const rapidjson::Value* value_ptr = NULL;
+    const BUTIL_RAPIDJSON_NAMESPACE::Value* value_ptr = nullptr;
     for (size_t i = 0; i < fields.size(); ++i) {
         const google::protobuf::FieldDescriptor* field = fields[i];
         
-        const std::string& orig_name = field->name();
+        const std::string orig_name = butil::EnsureString(field->name());
         bool res = decode_name(orig_name, field_name_str_temp); 
         const std::string& field_name_str = (res ? field_name_str_temp : orig_name);
 
 #ifndef RAPIDJSON_VERSION_0_1
-        rapidjson::Value::ConstMemberIterator member =
+        BUTIL_RAPIDJSON_NAMESPACE::Value::ConstMemberIterator member =
                 json_value.FindMember(field_name_str.data());
         if (member == json_value.MemberEnd()) {
             if (field->is_required()) {
-                J2PERROR(err, "Missing required field: %s", field->full_name().c_str());
+                J2PERROR(err, "Missing required field: %s", butil::EnsureString(field->full_name()).c_str());
                 return false;
             }
             continue; 
         }
         value_ptr = &(member->value);
 #else 
-        const rapidjson::Value::Member* member =
+        const BUTIL_RAPIDJSON_NAMESPACE::Value::Member* member =
                 json_value.FindMember(field_name_str.data());
-        if (member == NULL) {
+        if (member == nullptr) {
             if (field->is_required()) {
-                J2PERROR(err, "Missing required field: %s", field->full_name().c_str());
+                J2PERROR(err, "Missing required field: %s", butil::EnsureString(field->full_name()).c_str());
                 return false;
             }
             continue; 
@@ -463,11 +616,11 @@ bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
 
         if (IsProtobufMap(field) && value_ptr->IsObject()) {
             // Try to parse json like {"key":value, ...} into protobuf map
-            if (!JsonMapToProtoMap(*value_ptr, field, message, options, err)) {
+            if (!JsonMapToProtoMap(*value_ptr, field, message, options, err, depth)) {
                 return false;
             }
         } else {
-            if (!JsonValueToProtoField(*value_ptr, field, message, options, err)) {
+            if (!JsonValueToProtoField(*value_ptr, field, message, options, err, depth)) {
                 return false;
             }
         }
@@ -475,51 +628,89 @@ bool JsonValueToProtoMessage(const rapidjson::Value& json_value,
     return true;
 }
 
-bool ZeroCopyStreamToJson(rapidjson::Document *dest, 
-                          google::protobuf::io::ZeroCopyInputStream *stream) {
-    ZeroCopyStreamReader stream_reader(stream);
-    dest->ParseStream<0, rapidjson::UTF8<> >(stream_reader);
-    return !dest->HasParseError();
-}
-
 inline bool JsonToProtoMessageInline(const std::string& json_string, 
                         google::protobuf::Message* message,
                         const Json2PbOptions& options,
-                        std::string* error) {
+                        std::string* error,
+                        size_t* parsed_offset) {
     if (error) {
         error->clear();
     }
-    rapidjson::Document d;
-    d.Parse<0>(json_string.c_str());
-    return json2pb::JsonValueToProtoMessage(d, message, options, error);
+    BUTIL_RAPIDJSON_NAMESPACE::Document d;
+    if (options.allow_remaining_bytes_after_parsing) {
+        d.Parse<RAPIDJSON_PARSE_FLAG_STOP_WHEN_DONE>(json_string.c_str());
+        if (parsed_offset != nullptr) {
+            *parsed_offset = d.GetErrorOffset();
+        }
+    } else {
+        d.Parse<RAPIDJSON_PARSE_FLAG_DEFAULT>(json_string.c_str());
+    }
+    if (d.HasParseError()) {
+        if (options.allow_remaining_bytes_after_parsing) {
+            if (d.GetParseError() == BUTIL_RAPIDJSON_NAMESPACE::kParseErrorDocumentEmpty) {
+                // This is usual when parsing multiple jsons, don't waste time
+                // on setting the `empty error'
+                return false;
+            }
+        }
+        J2PERROR_WITH_PB(message, error, "Invalid json: %s", BUTIL_RAPIDJSON_NAMESPACE::GetParseError_En(d.GetParseError()));
+        return false;
+    }
+    return JsonValueToProtoMessage(d, message, options, error, 0);
 }
 
 bool JsonToProtoMessage(const std::string& json_string,
                         google::protobuf::Message* message,
                         const Json2PbOptions& options,
-                        std::string* error) {
-    return JsonToProtoMessageInline(json_string, message, options, error);
+                        std::string* error,
+                        size_t* parsed_offset) {
+    return JsonToProtoMessageInline(json_string, message, options, error, parsed_offset);
 }
 
 bool JsonToProtoMessage(google::protobuf::io::ZeroCopyInputStream* stream,
                         google::protobuf::Message* message,
                         const Json2PbOptions& options,
-                        std::string* error) {
+                        std::string* error,
+                        size_t* parsed_offset) {
+    ZeroCopyStreamReader reader(stream);
+    return JsonToProtoMessage(&reader, message, options, error, parsed_offset);
+}
+
+bool JsonToProtoMessage(ZeroCopyStreamReader* reader,
+                        google::protobuf::Message* message,
+                        const Json2PbOptions& options,
+                        std::string* error,
+                        size_t* parsed_offset) {
     if (error) {
         error->clear();
     }
-    rapidjson::Document d;
-    if (!json2pb::ZeroCopyStreamToJson(&d, stream)) {
-        J2PERROR(error, "Invalid json format");
+    BUTIL_RAPIDJSON_NAMESPACE::Document d;
+    if (options.allow_remaining_bytes_after_parsing) {
+        d.ParseStream<RAPIDJSON_PARSE_FLAG_STOP_WHEN_DONE, BUTIL_RAPIDJSON_NAMESPACE::UTF8<>>(*reader);
+        if (parsed_offset != nullptr) {
+            *parsed_offset = d.GetErrorOffset();
+        }
+    } else {
+        d.ParseStream<RAPIDJSON_PARSE_FLAG_DEFAULT, BUTIL_RAPIDJSON_NAMESPACE::UTF8<>>(*reader);
+    }
+    if (d.HasParseError()) {
+        if (options.allow_remaining_bytes_after_parsing) {
+            if (d.GetParseError() == BUTIL_RAPIDJSON_NAMESPACE::kParseErrorDocumentEmpty) {
+                // This is usual when parsing multiple jsons, don't waste time
+                // on setting the `empty error'
+                return false;
+            }
+        }
+        J2PERROR_WITH_PB(message, error, "Invalid json: %s", BUTIL_RAPIDJSON_NAMESPACE::GetParseError_En(d.GetParseError()));
         return false;
     }
-    return json2pb::JsonValueToProtoMessage(d, message, options, error);
+    return JsonValueToProtoMessage(d, message, options, error, 0);
 }
 
 bool JsonToProtoMessage(const std::string& json_string, 
                         google::protobuf::Message* message,
                         std::string* error) {
-    return JsonToProtoMessageInline(json_string, message, Json2PbOptions(), error);
+    return JsonToProtoMessageInline(json_string, message, Json2PbOptions(), error, nullptr);
 }
 
 // For ABI compatibility with 1.0.0.0
@@ -529,22 +720,56 @@ bool JsonToProtoMessage(const std::string& json_string,
 bool JsonToProtoMessage(std::string json_string, 
                         google::protobuf::Message* message,
                         std::string* error) {
-    return JsonToProtoMessageInline(json_string, message, Json2PbOptions(), error);
+    return JsonToProtoMessageInline(json_string, message, Json2PbOptions(), error, nullptr);
 }
 
 bool JsonToProtoMessage(google::protobuf::io::ZeroCopyInputStream *stream,
                         google::protobuf::Message* message,
                         std::string* error) {
-    if (error) {
-        error->clear();
+    return JsonToProtoMessage(stream, message, Json2PbOptions(), error, nullptr);
+}
+
+bool ProtoJsonToProtoMessage(google::protobuf::io::ZeroCopyInputStream* json,
+                             google::protobuf::Message* message,
+                             const ProtoJson2PbOptions& options,
+                             std::string* error) {
+#if GOOGLE_PROTOBUF_VERSION >= 6031000
+    auto st = google::protobuf::json::JsonStreamToMessage(json, message, options);
+    bool ok = st.ok();
+    if (!ok && nullptr != error) {
+        *error = st.ToString();
     }
-    rapidjson::Document d;
-    if (!json2pb::ZeroCopyStreamToJson(&d, stream)) {
-        J2PERROR(error, "Invalid json format");
+    return ok;
+#else
+    TypeResolverUniqueptr type_resolver = GetTypeResolver(*message);
+    std::string type_url = GetTypeUrl(*message);
+    butil::IOBuf buf;
+    butil::IOBufAsZeroCopyOutputStream output_stream(&buf);
+    auto st = google::protobuf::util::JsonToBinaryStream(
+        type_resolver.get(), type_url, json, &output_stream, options);
+    if (!st.ok()) {
+        if (nullptr != error) {
+            *error = st.ToString();
+        }
         return false;
     }
-    return json2pb::JsonValueToProtoMessage(d, message, Json2PbOptions(), error);
+
+    butil::IOBufAsZeroCopyInputStream input_stream(buf);
+    google::protobuf::io::CodedInputStream decoder(&input_stream);
+    bool ok = message->ParseFromCodedStream(&decoder);
+    if (!ok && nullptr != error) {
+        *error = "Fail to ParseFromCodedStream";
+    }
+    return ok;
+#endif // GOOGLE_PROTOBUF_VERSION >= 6031000
 }
+
+bool ProtoJsonToProtoMessage(const std::string& json, google::protobuf::Message* message,
+                             const ProtoJson2PbOptions& options, std::string* error) {
+    google::protobuf::io::ArrayInputStream input_stream(json.data(), json.size());
+    return ProtoJsonToProtoMessage(&input_stream, message, options, error);
+}
+
 } //namespace json2pb
 
 #undef J2PERROR

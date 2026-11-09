@@ -1,18 +1,20 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #ifndef BRPC_NAMING_SERVICE_THREAD_H
 #define BRPC_NAMING_SERVICE_THREAD_H
@@ -24,7 +26,8 @@
 #include "brpc/shared_object.h"                 // SharedObject
 #include "brpc/naming_service.h"                // NamingService
 #include "brpc/naming_service_filter.h"         // NamingServiceFilter
-
+#include "brpc/socket_map.h"
+#include "brpc/socket_mode.h"
 
 namespace brpc {
 
@@ -42,10 +45,14 @@ public:
 struct GetNamingServiceThreadOptions {
     GetNamingServiceThreadOptions()
         : succeed_without_server(false)
-        , log_succeed_without_server(true) {}
+        , log_succeed_without_server(true) {
+    socket_option.socket_mode = SOCKET_MODE_TCP;
+}
     
     bool succeed_without_server;
     bool log_succeed_without_server;
+    ChannelSignature channel_signature;
+    SocketOptions socket_option;
 };
 
 // A dedicated thread to map a name to ServerIds
@@ -60,11 +67,11 @@ class NamingServiceThread : public SharedObject, public Describable {
     };
     class Actions : public NamingServiceActions {
     public:
-        Actions(NamingServiceThread* owner);
-        ~Actions();
-        void AddServers(const std::vector<ServerNode>& servers);
-        void RemoveServers(const std::vector<ServerNode>& servers);
-        void ResetServers(const std::vector<ServerNode>& servers);
+        explicit Actions(NamingServiceThread* owner);
+        ~Actions() override;
+        void AddServers(const std::vector<ServerNode>& servers) override;
+        void RemoveServers(const std::vector<ServerNode>& servers) override;
+        void ResetServers(const std::vector<ServerNode>& servers) override;
         int WaitForFirstBatchOfServers();
         void EndWait(int error_code);
 
@@ -84,17 +91,20 @@ class NamingServiceThread : public SharedObject, public Describable {
 
 public:    
     NamingServiceThread();
-    ~NamingServiceThread();
+    ~NamingServiceThread() override;
 
-    int Start(const NamingService* ns, const std::string& service_name,
+    int Start(NamingService* ns,
+              const std::string& protocol,
+              const std::string& service_name,
               const GetNamingServiceThreadOptions* options);
     int WaitForFirstBatchOfServers();
+    void EndWait(int error_code);
 
     int AddWatcher(NamingServiceWatcher* w, const NamingServiceFilter* f);
-    int AddWatcher(NamingServiceWatcher* w) { return AddWatcher(w, NULL); }
+    int AddWatcher(NamingServiceWatcher* w) { return AddWatcher(w, nullptr); }
     int RemoveWatcher(NamingServiceWatcher* w);
 
-    void Describe(std::ostream& os, const DescribeOptions&) const;
+    void Describe(std::ostream& os, const DescribeOptions&) const override;
 
 private:
     void Run();
@@ -106,9 +116,8 @@ private:
 
     butil::Mutex _mutex;
     bthread_t _tid;
-    // TODO: better use a name.
-    const NamingService* _source_ns;
     NamingService* _ns;
+    std::string _protocol;
     std::string _service_name;
     GetNamingServiceThreadOptions _options;
     std::vector<ServerNodeWithId> _last_sockets;

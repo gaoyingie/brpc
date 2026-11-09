@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_OBSERVER_LIST_H__
-#define BASE_OBSERVER_LIST_H__
+#ifndef BUTIL_OBSERVER_LIST_H__
+#define BUTIL_OBSERVER_LIST_H__
 
 #include <algorithm>
 #include <limits>
@@ -95,13 +95,13 @@ class ObserverListBase
 
     ObserverType* GetNext() {
       if (!list_.get())
-        return NULL;
+        return nullptr;
       ListType& observers = list_->observers_;
       // Advance if the current element is null
       size_t max_index = std::min(max_index_, observers.size());
       while (index_ < max_index && !observers[index_])
         ++index_;
-      return index_ < max_index ? observers[index_++] : NULL;
+      return index_ < max_index ? observers[index_++] : nullptr;
     }
 
    private:
@@ -163,7 +163,7 @@ class ObserverListBase
   void Compact() {
     observers_.erase(
         std::remove(observers_.begin(), observers_.end(),
-                    static_cast<ObserverType*>(NULL)), observers_.end());
+                    static_cast<ObserverType*>(nullptr)), observers_.end());
   }
 
  private:
@@ -209,9 +209,9 @@ class ObserverList : public ObserverListBase<ObserverType> {
       ObserverListBase<ObserverType>::Iterator                             \
           it_inside_observer_macro(observer_list);                         \
       ObserverType* obs;                                                   \
-      while ((obs = it_inside_observer_macro.GetNext()) != NULL)           \
+      while ((obs = it_inside_observer_macro.GetNext()) != nullptr)           \
         obs->func;                                                         \
     }                                                                      \
   } while (0)
 
-#endif  // BASE_OBSERVER_LIST_H__
+#endif  // BUTIL_OBSERVER_LIST_H__

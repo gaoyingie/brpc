@@ -1,23 +1,43 @@
-// Copyright (c) 2017 Baidu, Inc
-// Date: Thu Jan 19 16:19:30 CST 2017
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-#ifndef BASE_SYNCHRONIZATION_LOCK_H_
-#define BASE_SYNCHRONIZATION_LOCK_H_
+#ifndef BUTIL_SYNCHRONIZATION_LOCK_H_
+#define BUTIL_SYNCHRONIZATION_LOCK_H_
 
 #include "butil/build_config.h"
 #if defined(OS_WIN)
 #include <windows.h>
 #elif defined(OS_POSIX)
 #include <pthread.h>
-#endif
+#if defined(OS_LINUX) && defined(__USE_XOPEN2K)
+#define HAS_PTHREAD_MUTEX_TIMEDLOCK 1
+#else
+#define HAS_PTHREAD_MUTEX_TIMEDLOCK 0
+#endif // OS_LINUX __USE_XOPEN2K
+#endif // OS_POSIX
 
 #include "butil/base_export.h"
 #include "butil/macros.h"
+#include "butil/compat.h"
 
 namespace butil {
 
 // A convenient wrapper for an OS specific critical section.  
-class BASE_EXPORT Mutex {
+class BUTIL_EXPORT Mutex {
     DISALLOW_COPY_AND_ASSIGN(Mutex);
 public:
 #if defined(OS_WIN)
@@ -33,7 +53,7 @@ public:
     // contending thread from going to sleep which helps performance greatly.
         ::InitializeCriticalSectionAndSpinCount(&_native_handle, 2000);
 #elif defined(OS_POSIX)
-        pthread_mutex_init(&_native_handle, NULL);
+        pthread_mutex_init(&_native_handle, nullptr);
 #endif
     }
     
@@ -75,6 +95,12 @@ public:
 #endif
     }
 
+#if HAS_PTHREAD_MUTEX_TIMEDLOCK
+    bool timed_lock(const struct timespec* abstime) {
+        return pthread_mutex_timedlock(&_native_handle, abstime) == 0;
+    }
+#endif // HAS_PTHREAD_MUTEX_TIMEDLOCK
+
     // Returns the underlying implementation-defined native handle object.
     NativeHandle* native_handle() { return &_native_handle; }
 
@@ -94,7 +120,7 @@ friend class WinVistaCondVar;
 };
 
 // TODO: Remove this type.
-class BASE_EXPORT Lock : public Mutex {
+class BUTIL_EXPORT Lock : public Mutex {
     DISALLOW_COPY_AND_ASSIGN(Lock);
 public:
     Lock() {}
@@ -149,4 +175,4 @@ private:
 
 }  // namespace butil
 
-#endif  // BASE_SYNCHRONIZATION_LOCK_H_
+#endif  // BUTIL_SYNCHRONIZATION_LOCK_H_

@@ -1,45 +1,51 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <iomanip>
 #include <sys/time.h>
-#include <fcntl.h>                          // O_RDONLY
+#include <fcntl.h>                           // O_RDONLY
 #include <gflags/gflags.h>
 #include "butil/logging.h"
 #include "butil/fd_guard.h"                  // fd_guard
 #include "butil/file_util.h"                 // butil::FilePath
 #include "butil/third_party/murmurhash3/murmurhash3.h"
+#include "butil/process_util.h"              // ReadCommandLine
 #include "brpc/server.h"
+#include "brpc/reloadable_flags.h"
 #include "brpc/builtin/common.h"
-
 
 namespace brpc {
 
 DEFINE_string(rpc_profiling_dir, "./rpc_data/profiling",
               "For storing profiling results.");
 
+DEFINE_int32(max_profiling_seconds, 300, "upper limit of running time of profilers");
+BRPC_VALIDATE_GFLAG(max_profiling_seconds, PositiveInteger);
+
 bool UseHTML(const HttpHeader& header) {
     const std::string* console = header.uri().GetQuery(CONSOLE_STR);
-    if (console != NULL) {
+    if (console != nullptr) {
         return atoi(console->c_str()) == 0;
     }
     // [curl header]
     // User-Agent: curl/7.12.1 (x86_64-redhat-linux-gnu) libcurl/7.12.1 ...
     const std::string* agent = header.GetHeader(USER_AGENT_STR);
-    if (agent == NULL) {  // use text when user-agent is absent
+    if (agent == nullptr) {  // use text when user-agent is absent
         return false;
     }
     return agent->find("curl/") == std::string::npos;
@@ -48,8 +54,8 @@ bool UseHTML(const HttpHeader& header) {
 // Written by Jack Handy
 // <A href="mailto:jakkhandy@hotmail.com">jakkhandy@hotmail.com</A>
 inline bool url_wildcmp(const char* wild, const char* str) {
-    const char* cp = NULL;
-    const char* mp = NULL;
+    const char* cp = nullptr;
+    const char* mp = nullptr;
 
     while (*str && *wild != '*') {
         if (*wild != *str && *wild != '$') {
@@ -306,44 +312,9 @@ const char* ProfilingType2String(ProfilingType t) {
     case PROFILING_HEAP: return "heap";
     case PROFILING_GROWTH: return "growth";
     case PROFILING_CONTENTION: return "contention";
+    case PROFILING_IOBUF: return "iobuf";
     }
     return "unknown";
-}
-
-ssize_t ReadCommandLine(char* buf, size_t len, bool with_args) {
-    butil::fd_guard fd(open("/proc/self/cmdline", O_RDONLY));
-    if (fd < 0) {
-        LOG(ERROR) << "Fail to open /proc/self/cmdline";
-        return -1;
-    }
-    ssize_t nr = read(fd, buf, len);
-    if (nr <= 0) {
-        LOG(ERROR) << "Fail to read /proc/self/cmdline";
-        return -1;
-    }
-    if (with_args) {
-        if ((size_t)nr == len) {
-            LOG(ERROR) << "buf is not big enough";
-            return -1;
-        }
-        for (ssize_t i = 0; i < nr; ++i) {
-            if (buf[i] == '\0') {
-                buf[i] = '\n';
-            }
-        }
-        return nr;
-    } else {
-        for (ssize_t i = 0; i < nr; ++i) {
-            if (buf[i] == '\0') {
-                return i;
-            }
-        }
-        if ((size_t)nr == len) {
-            LOG(ERROR) << "buf is not big enough";
-            return -1;
-        }
-        return nr;
-    }
 }
 
 int FileChecksum(const char* file_path, unsigned char* checksum) {
@@ -367,23 +338,41 @@ static pthread_once_t create_program_name_once = PTHREAD_ONCE_INIT;
 static const char* s_program_name = "unknown";
 static char s_cmdline[256];
 static void CreateProgramName() {
-    const ssize_t nr = ReadCommandLine(s_cmdline, sizeof(s_cmdline) - 1, false);
+    const ssize_t nr = butil::ReadCommandLine(s_cmdline, sizeof(s_cmdline) - 1, false);
     if (nr > 0) {
         s_cmdline[nr] = '\0';
         s_program_name = s_cmdline;
     }
 }
+
 const char* GetProgramName() {
     pthread_once(&create_program_name_once, CreateProgramName);
     return s_program_name;
 }
+
+static pthread_once_t create_program_path_once = PTHREAD_ONCE_INIT;
+static const char* s_program_path = "unknown";
+static char s_program_exec_path[PATH_MAX];
+static void CreateProgramPath() {
+    const ssize_t nr = butil::GetProcessAbsolutePath(s_program_exec_path, sizeof(s_program_exec_path) - 1);
+    if (nr > 0) {
+        s_program_exec_path[nr] = '\0';
+        s_program_path = s_program_exec_path;
+    }
+}
+
+const char* GetProgramPath() {
+    pthread_once(&create_program_path_once, CreateProgramPath);
+    return s_program_path;
+}
+
 
 static pthread_once_t compute_program_checksum_once = PTHREAD_ONCE_INIT;
 static char s_program_checksum[33];
 static const char s_alphabet[] = "0123456789abcdef";
 static void ComputeProgramCHECKSUM() {
     unsigned char checksum[16];
-    FileChecksum(GetProgramName(), checksum);
+    FileChecksum(GetProgramPath(), checksum);
     for (size_t i = 0, j = 0; i < 16; ++i, j+=2) {
         s_program_checksum[j] = s_alphabet[checksum[i] >> 4];
         s_program_checksum[j+1] = s_alphabet[checksum[i] & 0xF];
@@ -399,7 +388,7 @@ const char* GetProgramChecksum() {
 bool SupportGzip(Controller* cntl) {
     const std::string* encodings =
         cntl->http_request().GetHeader("Accept-Encoding");
-    if (encodings == NULL) {
+    if (encodings == nullptr) {
         return false;
     }
     return encodings->find("gzip") != std::string::npos;

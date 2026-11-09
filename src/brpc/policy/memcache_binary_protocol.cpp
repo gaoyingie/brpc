@@ -1,18 +1,20 @@
-// Copyright (c) 2015 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>         // MethodDescriptor
 #include <google/protobuf/message.h>            // Message
@@ -38,6 +40,7 @@
 namespace brpc {
 
 DECLARE_bool(enable_rpcz);
+DECLARE_uint64(max_body_size);
 
 namespace policy {
 
@@ -63,6 +66,7 @@ static void InitSupportedCommandMap() {
     butil::bit_array_set(supported_cmd_map, MC_BINARY_PREPEND);
     butil::bit_array_set(supported_cmd_map, MC_BINARY_STAT);
     butil::bit_array_set(supported_cmd_map, MC_BINARY_TOUCH);
+    butil::bit_array_set(supported_cmd_map, MC_BINARY_SASL_AUTH);
 }
 
 inline bool IsSupportedCommand(uint8_t command) {
@@ -74,7 +78,7 @@ ParseResult ParseMemcacheMessage(butil::IOBuf* source,
                                  Socket* socket, bool /*read_eof*/, const void */*arg*/) {
     while (1) {
         const uint8_t* p_mcmagic = (const uint8_t*)source->fetch1();
-        if (NULL == p_mcmagic) {
+        if (nullptr == p_mcmagic) {
             return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
         }            
         if (*p_mcmagic != (uint8_t)MC_MAGIC_RESPONSE) {
@@ -82,11 +86,14 @@ ParseResult ParseMemcacheMessage(butil::IOBuf* source,
         }
         char buf[24];
         const uint8_t* p = (const uint8_t*)source->fetch(buf, sizeof(buf));
-        if (NULL == p) {
+        if (nullptr == p) {
             return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
         }
         const MemcacheResponseHeader* header = (const MemcacheResponseHeader*)p;
         uint32_t total_body_length = butil::NetToHost32(header->total_body_length);
+        if (total_body_length > FLAGS_max_body_size) {
+            return MakeParseError(PARSE_ERROR_TOO_BIG_DATA);
+        }
         if (source->size() < sizeof(*header) + total_body_length) {
             return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
         }
@@ -105,7 +112,7 @@ ParseResult ParseMemcacheMessage(butil::IOBuf* source,
         }
         MostCommonMessage* msg =
             static_cast<MostCommonMessage*>(socket->parsing_context());
-        if (msg == NULL) {
+        if (msg == nullptr) {
             msg = MostCommonMessage::Get();
             socket->reset_parsing_context(msg);
         }
@@ -125,14 +132,28 @@ ParseResult ParseMemcacheMessage(butil::IOBuf* source,
         msg->meta.append(&local_header, sizeof(local_header));
         source->pop_front(sizeof(*header));
         source->cutn(&msg->meta, total_body_length);
-        if (++msg->pi.count >= pi.count) {
-            CHECK_EQ(msg->pi.count, pi.count);
-            msg = static_cast<MostCommonMessage*>(socket->release_parsing_context());
-            msg->pi = pi;
-            return MakeMessage(msg);
-        } else {
+        // `header' points into source's front block; pop_front above may have
+        // released that block, so read the already byte-swapped local_header
+        // here instead of dereferencing the now-dangling `header'.
+        if (local_header.command == MC_BINARY_SASL_AUTH) {
+            if (local_header.status != 0) {
+                LOG(ERROR) << "Failed to authenticate the couchbase bucket.";
+                return MakeParseError(PARSE_ERROR_NO_RESOURCE, 
+                                      "Fail to authenticate with the couchbase bucket");
+            }
+            DestroyingPtr<MostCommonMessage> auth_msg(
+                 static_cast<MostCommonMessage*>(socket->release_parsing_context()));
             socket->GivebackPipelinedInfo(pi);
-        }
+        } else {
+            if (++msg->pi.count >= pi.count) {
+                CHECK_EQ(msg->pi.count, pi.count);
+                msg = static_cast<MostCommonMessage*>(socket->release_parsing_context());
+                msg->pi = pi;
+                return MakeMessage(msg);
+            } else {
+                socket->GivebackPipelinedInfo(pi);
+            }
+        }    
     }
 }
 
@@ -141,7 +162,7 @@ void ProcessMemcacheResponse(InputMessageBase* msg_base) {
     DestroyingPtr<MostCommonMessage> msg(static_cast<MostCommonMessage*>(msg_base));
 
     const bthread_id_t cid = msg->pi.id_wait;
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
@@ -150,15 +171,14 @@ void ProcessMemcacheResponse(InputMessageBase* msg_base) {
     }
     
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.length());
         span->set_start_parse_us(start_parse_us);
     }
     const int saved_error = cntl->ErrorCode();
-    if (cntl->response() == NULL) {
+    if (cntl->response() == nullptr) {
         cntl->SetFailed(ERESPONSE, "response is NULL!");
     } else if (cntl->response()->GetDescriptor() != MemcacheResponse::descriptor()) {
         cntl->SetFailed(ERESPONSE, "Must be MemcacheResponse");
@@ -173,14 +193,14 @@ void ProcessMemcacheResponse(InputMessageBase* msg_base) {
     }
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 
 void SerializeMemcacheRequest(butil::IOBuf* buf,
                               Controller* cntl,
                               const google::protobuf::Message* request) {
-    if (request == NULL) {
+    if (request == nullptr) {
         return cntl->SetFailed(EREQUEST, "request is NULL");
     }
     if (request->GetDescriptor() != MemcacheRequest::descriptor()) {
@@ -196,9 +216,16 @@ void PackMemcacheRequest(butil::IOBuf* buf,
                          SocketMessage**,
                          uint64_t /*correlation_id*/,
                          const google::protobuf::MethodDescriptor*,
-                         Controller*,
+                         Controller* cntl,
                          const butil::IOBuf& request,
-                         const Authenticator* /*auth*/) {
+                         const Authenticator* auth) {
+    if (auth) {
+        std::string auth_str;
+        if (auth->GenerateCredential(&auth_str) != 0) {
+            return cntl->SetFailed(EREQUEST, "Fail to generate credential");
+        }
+        buf->append(auth_str);
+    }
     buf->append(request);
 }
 

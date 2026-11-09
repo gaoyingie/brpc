@@ -31,7 +31,7 @@ Location::Location()
     : function_name_("Unknown"),
       file_name_("Unknown"),
       line_number_(-1),
-      program_counter_(NULL) {
+      program_counter_(nullptr) {
 }
 
 std::string Location::ToString() const {
@@ -89,13 +89,13 @@ LocationSnapshot::~LocationSnapshot() {
 #if defined(COMPILER_MSVC)
 __declspec(noinline)
 #endif
-BASE_EXPORT const void* GetProgramCounter() {
+BUTIL_EXPORT const void* GetProgramCounter() {
 #if defined(COMPILER_MSVC)
   return _ReturnAddress();
 #elif defined(COMPILER_GCC) && !defined(OS_NACL)
   return __builtin_extract_return_addr(__builtin_return_address(0));
 #else
-  return NULL;
+  return nullptr;
 #endif
 }
 

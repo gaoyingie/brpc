@@ -3,7 +3,7 @@
 // found in the LICENSE file.
 
 // Weak pointers are pointers to an object that do not affect its lifetime,
-// and which may be invalidated (i.e. reset to NULL) by the object, or its
+// and which may be invalidated (i.e. reset to nullptr) by the object, or its
 // owner, at any time, most commonly when the object is about to be deleted.
 
 // Weak pointers are useful when an object needs to be accessed safely by one
@@ -60,8 +60,8 @@
 // Invalidating the factory's WeakPtrs un-binds it from the thread, allowing it
 // to be passed for a different thread to use or delete it.
 
-#ifndef BASE_MEMORY_WEAK_PTR_H_
-#define BASE_MEMORY_WEAK_PTR_H_
+#ifndef BUTIL_MEMORY_WEAK_PTR_H_
+#define BUTIL_MEMORY_WEAK_PTR_H_
 
 #include "butil/basictypes.h"
 #include "butil/base_export.h"
@@ -78,11 +78,11 @@ namespace internal {
 // These classes are part of the WeakPtr implementation.
 // DO NOT USE THESE CLASSES DIRECTLY YOURSELF.
 
-class BASE_EXPORT WeakReference {
+class BUTIL_EXPORT WeakReference {
  public:
   // Although Flag is bound to a specific thread, it may be deleted from another
   // via butil::WeakPtr::~WeakPtr().
-  class BASE_EXPORT Flag : public RefCountedThreadSafe<Flag> {
+  class BUTIL_EXPORT Flag : public RefCountedThreadSafe<Flag> {
    public:
     Flag();
 
@@ -107,7 +107,7 @@ class BASE_EXPORT WeakReference {
   scoped_refptr<const Flag> flag_;
 };
 
-class BASE_EXPORT WeakReferenceOwner {
+class BUTIL_EXPORT WeakReferenceOwner {
  public:
   WeakReferenceOwner();
   ~WeakReferenceOwner();
@@ -128,7 +128,7 @@ class BASE_EXPORT WeakReferenceOwner {
 // constructor by avoiding the need for a public accessor for ref_.  A
 // WeakPtr<T> cannot access the private members of WeakPtr<U>, so this
 // base class gives us a way to access ref_ in a protected fashion.
-class BASE_EXPORT WeakPtrBase {
+class BUTIL_EXPORT WeakPtrBase {
  public:
   WeakPtrBase();
   ~WeakPtrBase();
@@ -189,7 +189,7 @@ template <typename T> class WeakPtrFactory;
 template <typename T>
 class WeakPtr : public internal::WeakPtrBase {
  public:
-  WeakPtr() : ptr_(NULL) {
+  WeakPtr() : ptr_(nullptr) {
   }
 
   // Allow conversion from U to T provided U "is a" T. Note that this
@@ -198,14 +198,14 @@ class WeakPtr : public internal::WeakPtrBase {
   WeakPtr(const WeakPtr<U>& other) : WeakPtrBase(other), ptr_(other.ptr_) {
   }
 
-  T* get() const { return ref_.is_valid() ? ptr_ : NULL; }
+  T* get() const { return ref_.is_valid() ? ptr_ : nullptr; }
 
   T& operator*() const {
-    DCHECK(get() != NULL);
+    DCHECK(get() != nullptr);
     return *get();
   }
   T* operator->() const {
-    DCHECK(get() != NULL);
+    DCHECK(get() != nullptr);
     return get();
   }
 
@@ -220,11 +220,11 @@ class WeakPtr : public internal::WeakPtrBase {
   typedef T* WeakPtr::*Testable;
 
  public:
-  operator Testable() const { return get() ? &WeakPtr::ptr_ : NULL; }
+  operator Testable() const { return get() ? &WeakPtr::ptr_ : nullptr; }
 
   void reset() {
     ref_ = internal::WeakReference();
-    ptr_ = NULL;
+    ptr_ = nullptr;
   }
 
  private:
@@ -244,7 +244,7 @@ class WeakPtr : public internal::WeakPtrBase {
   }
 
   // This pointer is only valid when ref_.is_valid() is true.  Otherwise, its
-  // value is undefined (as opposed to NULL).
+  // value is undefined (as opposed to nullptr).
   T* ptr_;
 };
 
@@ -260,7 +260,7 @@ class WeakPtrFactory {
   }
 
   ~WeakPtrFactory() {
-    ptr_ = NULL;
+    ptr_ = nullptr;
   }
 
   WeakPtr<T> GetWeakPtr() {
@@ -333,4 +333,4 @@ WeakPtr<Derived> AsWeakPtr(Derived* t) {
 
 }  // namespace butil
 
-#endif  // BASE_MEMORY_WEAK_PTR_H_
+#endif  // BUTIL_MEMORY_WEAK_PTR_H_

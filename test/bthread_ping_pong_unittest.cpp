@@ -1,5 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// Author: Ge,Jun (gejun@baidu.com)
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 #include <stdlib.h>
 #include <unistd.h>
@@ -7,6 +21,7 @@
 #include <signal.h>
 #include <gflags/gflags.h>
 #include <gtest/gtest.h>
+#include "butil/compat.h"
 #include "butil/time.h"
 #include "butil/macros.h"
 #include "butil/errno.h"
@@ -21,7 +36,7 @@ DEFINE_bool(loop, false, "run until ctrl-C is pressed");
 DEFINE_bool(use_futex, false, "use futex instead of pipe");
 DEFINE_bool(use_butex, false, "use butex instead of pipe");
 
-void (*ignore_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
+void ALLOW_UNUSED (*ignore_sigpipe)(int) = signal(SIGPIPE, SIG_IGN);
 
 volatile bool stop = false;
 void quit_handler(int) {
@@ -48,22 +63,22 @@ void* pipe_player(void* void_arg) {
         ssize_t nr = read(arg->read_fd, &dummy, 1);
         if (nr <= 0) {
             if (nr == 0) {
-                printf("[%lu] EOF\n", pthread_self());
+                printf("[%" PRIu64 "] EOF\n", pthread_numeric_id());
                 break;
             }
             if (errno != EINTR) {
-                printf("[%lu] bad read, %m\n", pthread_self());
+                printf("[%" PRIu64 "] bad read, %m\n", pthread_numeric_id());
                 break;
             }
             continue;
         }
         if (1L != write(arg->write_fd, &dummy, 1)) {
-            printf("[%lu] bad write, %m\n", pthread_self());
+            printf("[%" PRIu64 "] bad write, %m\n", pthread_numeric_id());
             break;
         }
         ++arg->counter;
     }
-    return NULL;
+    return nullptr;
 }
 
 static const int INITIAL_FUTEX_VALUE = 0;
@@ -72,28 +87,28 @@ void* futex_player(void* void_arg) {
     PlayerArg* arg = static_cast<PlayerArg*>(void_arg);
     int counter = INITIAL_FUTEX_VALUE;
     while (!stop) {
-        int rc = bthread::futex_wait_private(arg->wait_addr, counter, NULL);
+        int rc = bthread::futex_wait_private(arg->wait_addr, counter, nullptr);
         ++counter;
         ++*arg->wake_addr;
         bthread::futex_wake_private(arg->wake_addr, 1);
         ++arg->counter;
         arg->wakeup += (rc == 0);
     }
-    return NULL;
+    return nullptr;
 }
 
 void* butex_player(void* void_arg) {
     PlayerArg* arg = static_cast<PlayerArg*>(void_arg);
     int counter = INITIAL_FUTEX_VALUE;
     while (!stop) {
-        int rc = bthread::butex_wait(arg->wait_addr, counter, NULL);
+        int rc = bthread::butex_wait(arg->wait_addr, counter, nullptr);
         ++counter;
         ++*arg->wake_addr;
         bthread::butex_wake(arg->wake_addr);
         ++arg->counter;
         arg->wakeup += (rc == 0);
     }
-    return NULL;
+    return nullptr;
 }
 
 TEST(PingPongTest, ping_pong) {
@@ -143,17 +158,17 @@ TEST(PingPongTest, ping_pong) {
         arg2->counter = 0;
         arg2->wakeup = 0;
 
-        pthread_t th1;
-        pthread_t th2;
+        pthread_t th1, th2;
+        bthread_t bth1, bth2;
         if (!FLAGS_use_futex && !FLAGS_use_butex) {
-            ASSERT_EQ(0, pthread_create(&th1, NULL, pipe_player, arg1));
-            ASSERT_EQ(0, pthread_create(&th2, NULL, pipe_player, arg2));
+            ASSERT_EQ(0, pthread_create(&th1, nullptr, pipe_player, arg1));
+            ASSERT_EQ(0, pthread_create(&th2, nullptr, pipe_player, arg2));
         } else if (FLAGS_use_futex) {
-            ASSERT_EQ(0, pthread_create(&th1, NULL, futex_player, arg1));
-            ASSERT_EQ(0, pthread_create(&th2, NULL, futex_player, arg2));
+            ASSERT_EQ(0, pthread_create(&th1, nullptr, futex_player, arg1));
+            ASSERT_EQ(0, pthread_create(&th2, nullptr, futex_player, arg2));
         } else if (FLAGS_use_butex) {
-            ASSERT_EQ(0, bthread_start_background(&th1, NULL, butex_player, arg1));
-            ASSERT_EQ(0, bthread_start_background(&th2, NULL, butex_player, arg2));
+            ASSERT_EQ(0, bthread_start_background(&bth1, nullptr, butex_player, arg1));
+            ASSERT_EQ(0, bthread_start_background(&bth2, nullptr, butex_player, arg2));
         } else {
             ASSERT_TRUE(false);
         }
@@ -187,11 +202,11 @@ TEST(PingPongTest, ping_pong) {
             cur_wakeup += args[i]->wakeup;
         }
         if (FLAGS_use_futex || FLAGS_use_butex) {
-            printf("pingpong-ed %ld/s, wakeup=%ld/s\n",
+            printf("pingpong-ed %" PRId64 "/s, wakeup=%" PRId64 "/s\n",
                    (cur_counter - last_counter) * 1000L / tm.m_elapsed(),
                    (cur_wakeup - last_wakeup) * 1000L / tm.m_elapsed());
         } else {
-            printf("pingpong-ed %ld/s\n",
+            printf("pingpong-ed %" PRId64 "/s\n",
                    (cur_counter - last_counter) * 1000L / tm.m_elapsed());
         }
         last_counter = cur_counter;

@@ -1,0 +1,2428 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+
+#include "brpc/policy/http2_rpc_protocol.h"
+#include "brpc/details/controller_private_accessor.h"
+#include "brpc/server.h"
+#include "butil/base64.h"
+#include "brpc/log.h"
+
+namespace brpc {
+
+DECLARE_bool(http_verbose);
+DECLARE_int32(http_verbose_max_body_length);
+DECLARE_int32(health_check_interval);
+DECLARE_bool(usercode_in_pthread);
+DECLARE_int64(socket_max_unwritten_bytes);
+DECLARE_uint32(http_max_header_count);
+
+namespace policy {
+
+DEFINE_int32(h2_client_header_table_size,
+             H2Settings::DEFAULT_HEADER_TABLE_SIZE,
+             "maximum size of compression tables for decoding headers");
+DEFINE_int32(h2_client_stream_window_size, 256 * 1024,
+             "Initial window size for stream-level flow control");
+DEFINE_int32(h2_client_connection_window_size, 1024 * 1024,
+             "Initial window size for connection-level flow control");
+DEFINE_int32(h2_client_max_frame_size,
+             H2Settings::DEFAULT_MAX_FRAME_SIZE,
+             "Size of the largest frame payload that client is willing to receive");
+DEFINE_int32(h2_client_max_header_list_size,
+             H2Settings::DEFAULT_MAX_HEADER_LIST_SIZE,
+             "Maximum decoded size of a header list that the client accepts"
+             " on a received stream, 0 or negative means unlimited");
+
+DEFINE_bool(h2_hpack_encode_name, false,
+            "Encode name in HTTP2 headers with huffman encoding");
+DEFINE_bool(h2_hpack_encode_value, false,
+            "Encode value in HTTP2 headers with huffman encoding");
+DEFINE_int64(h2_max_pending_data_bytes, 0,
+             "Max bytes of unsent HTTP/2 DATA buffered per connection due to "
+             "remote flow control. 0 means using -socket_max_unwritten_bytes");
+
+inline int64_t GetH2MaxPendingDataBytes() {
+    return FLAGS_h2_max_pending_data_bytes > 0
+        ? FLAGS_h2_max_pending_data_bytes
+        : FLAGS_socket_max_unwritten_bytes;
+}
+
+DEFINE_bool(h2_ack_ignore_eovercrowded, false,
+            "Let h2 control-frame replies (PING/SETTINGS acks, RST_STREAM, "
+            "GOAWAY, WINDOW_UPDATE) bypass -socket_max_unwritten_bytes. "
+            "Dangerous: a peer flooding PING frames while withholding TCP "
+            "reads then grows this process's memory without bound.");
+
+static bool CheckStreamWindowSize(const char*, int32_t val) {
+    return val >= 0;
+}
+BRPC_VALIDATE_GFLAG(h2_client_stream_window_size, CheckStreamWindowSize);
+
+static bool CheckConnWindowSize(const char*, int32_t val) {
+    return val >= (int32_t)H2Settings::DEFAULT_INITIAL_WINDOW_SIZE;
+}
+BRPC_VALIDATE_GFLAG(h2_client_connection_window_size, CheckConnWindowSize);
+
+const char* H2StreamState2Str(H2StreamState s) {
+    switch (s) {
+    case H2_STREAM_IDLE: return "idle";
+    case H2_STREAM_RESERVED_LOCAL: return "reserved(local)";
+    case H2_STREAM_RESERVED_REMOTE: return "reserved(remote)";
+    case H2_STREAM_OPEN: return "open";
+    case H2_STREAM_HALF_CLOSED_LOCAL: return "half-closed(local)";
+    case H2_STREAM_HALF_CLOSED_REMOTE: return "half-closed(remote)";
+    case H2_STREAM_CLOSED: return "closed";
+    }
+    return "unknown(H2StreamState)";
+}
+
+static const char* H2ConnectionState2Str(H2ConnectionState s) {
+    switch (s) {
+    case H2_CONNECTION_UNINITIALIZED: return "UNINITIALIZED";
+    case H2_CONNECTION_READY: return "READY";
+    case H2_CONNECTION_GOAWAY: return "GOAWAY";
+    }
+    return "UNKNOWN(H2ConnectionState)";
+}
+
+// A series of utilities to load numbers from http2 streams.
+inline uint8_t LoadUint8(butil::IOBufBytesIterator& it) {
+    uint8_t v = *it;
+    ++it;
+    return v;
+}
+inline uint16_t LoadUint16(butil::IOBufBytesIterator& it) {
+    uint16_t v = *it; ++it;
+    v = ((v << 8) | *it); ++it;
+    return v;
+}
+inline uint32_t LoadUint32(butil::IOBufBytesIterator& it) {
+    uint32_t v = *it; ++it;
+    v = ((v << 8) | *it); ++it;
+    v = ((v << 8) | *it); ++it;
+    v = ((v << 8) | *it); ++it;
+    return v;
+}
+inline void SaveUint16(void* out, uint16_t v) {
+    uint8_t* p = (uint8_t*)out;
+    p[0] = (v >> 8) & 0xFF;
+    p[1] = v & 0xFF;
+}
+inline void SaveUint32(void* out, uint32_t v) {
+    uint8_t* p = (uint8_t*)out;
+    p[0] = (v >> 24) & 0xFF;
+    p[1] = (v >> 16) & 0xFF;
+    p[2] = (v >> 8) & 0xFF;
+    p[3] = v & 0xFF;
+}
+
+const uint8_t H2_FLAGS_END_STREAM = 0x1;
+const uint8_t H2_FLAGS_ACK = 0x1;
+const uint8_t H2_FLAGS_END_HEADERS = 0x4;
+const uint8_t H2_FLAGS_PADDED = 0x8;
+const uint8_t H2_FLAGS_PRIORITY = 0x20;
+
+#define H2_CONNECTION_PREFACE_PREFIX "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+const size_t H2_CONNECTION_PREFACE_PREFIX_SIZE = 24;
+
+void SerializeFrameHead(void* out_buf,
+                        uint32_t payload_size, H2FrameType type,
+                        uint8_t flags, uint32_t stream_id) {
+    uint8_t* p = (uint8_t*)out_buf;
+    *p++ = (payload_size >> 16) & 0xFF;
+    *p++ = (payload_size >> 8) & 0xFF;
+    *p++ = payload_size & 0xFF;
+    *p++ = (uint8_t)type;
+    *p++ = flags;
+    *p++ = (stream_id >> 24) & 0xFF;
+    *p++ = (stream_id >> 16) & 0xFF;
+    *p++ = (stream_id >> 8) & 0xFF;
+    *p++ = stream_id & 0xFF;
+}
+
+inline void SerializeFrameHead(void* out_buf, const H2FrameHead& h) {
+    return SerializeFrameHead(out_buf, h.payload_size, h.type,
+                              h.flags, h.stream_id);
+}
+
+static int WriteAck(Socket* s, const void* data, size_t n) {
+    butil::IOBuf sendbuf;
+    sendbuf.append(data, n);
+    Socket::WriteOptions wopt;
+    // These writes historically ignored EOVERCROWDED so control replies
+    // could always be queued, but that defeats the explicit memory bound of
+    // -socket_max_unwritten_bytes: a peer flooding PING/SETTINGS frames
+    // while withholding TCP reads makes this process buffer ack frames
+    // without limit. Respect the bound by default; callers treat a failed
+    // ack write as a connection error and close the overcrowded connection.
+    wopt.ignore_eovercrowded = FLAGS_h2_ack_ignore_eovercrowded;
+    return s->Write(&sendbuf, &wopt);
+}
+
+static int WriteAck(Socket* s, butil::IOBuf* data) {
+    Socket::WriteOptions wopt;
+    wopt.ignore_eovercrowded = FLAGS_h2_ack_ignore_eovercrowded;
+    return s->Write(data, &wopt);
+}
+
+// [ https://tools.ietf.org/html/rfc7540#section-6.5.1 ]
+
+enum H2SettingsIdentifier {
+    H2_SETTINGS_HEADER_TABLE_SIZE      = 0x1,
+    H2_SETTINGS_ENABLE_PUSH            = 0x2,
+    H2_SETTINGS_MAX_CONCURRENT_STREAMS = 0x3,
+    H2_SETTINGS_STREAM_WINDOW_SIZE     = 0x4,
+    H2_SETTINGS_MAX_FRAME_SIZE         = 0x5,
+    H2_SETTINGS_MAX_HEADER_LIST_SIZE   = 0x6
+};
+
+// Parse from n bytes from the iterator.
+// Returns true on success.
+bool ParseH2Settings(H2Settings* out, butil::IOBufBytesIterator& it, size_t n) {
+    const uint32_t npairs = n / 6;
+    if (npairs * 6 != n) {
+        LOG(ERROR) << "Invalid payload_size=" << n;
+        return false;
+    }
+    for (uint32_t i = 0; i < npairs; ++i) {
+        uint16_t id = LoadUint16(it);
+        uint32_t value = LoadUint32(it);
+        switch (static_cast<H2SettingsIdentifier>(id)) {
+        case H2_SETTINGS_HEADER_TABLE_SIZE:
+            out->header_table_size = value;
+            break;
+        case H2_SETTINGS_ENABLE_PUSH:
+            if (value > 1) {
+                LOG(ERROR) << "Invalid value=" << value << " for ENABLE_PUSH";
+                return false;
+            }
+            out->enable_push = value;
+            break;
+        case H2_SETTINGS_MAX_CONCURRENT_STREAMS:
+            out->max_concurrent_streams = value;
+            break;
+        case H2_SETTINGS_STREAM_WINDOW_SIZE:
+            if (value > H2Settings::MAX_WINDOW_SIZE) {
+                LOG(ERROR) << "Invalid stream_window_size=" << value;
+                return false;
+            }
+            out->stream_window_size = value;
+            break;
+        case H2_SETTINGS_MAX_FRAME_SIZE:
+            if (value > H2Settings::MAX_OF_MAX_FRAME_SIZE ||
+                value < H2Settings::DEFAULT_MAX_FRAME_SIZE) {
+                LOG(ERROR) << "Invalid max_frame_size=" << value;
+                return false;
+            }
+            out->max_frame_size = value;
+            break;
+        case H2_SETTINGS_MAX_HEADER_LIST_SIZE:
+            out->max_header_list_size = value;
+            break;
+        default:
+            // An endpoint that receives a SETTINGS frame with any unknown or
+            // unsupported identifier MUST ignore that setting (section 6.5.2)
+            break;
+        }
+    }
+    return true;
+}
+
+// Maximum value that may be returned by SerializeH2Settings
+static const size_t H2_SETTINGS_MAX_BYTE_SIZE = 36;
+    
+// Serialize to `out' which is at least ByteSize() bytes long.
+// Returns bytes written.
+size_t SerializeH2Settings(const H2Settings& in, void* out) {
+    uint8_t* p = (uint8_t*)out;
+    if (in.header_table_size != H2Settings::DEFAULT_HEADER_TABLE_SIZE) {
+        SaveUint16(p, H2_SETTINGS_HEADER_TABLE_SIZE);
+        SaveUint32(p + 2, in.header_table_size);
+        p += 6;
+    }
+    if (in.enable_push != H2Settings::DEFAULT_ENABLE_PUSH) {
+        SaveUint16(p, H2_SETTINGS_ENABLE_PUSH);
+        SaveUint32(p + 2, in.enable_push);
+        p += 6;
+    }
+    if (in.max_concurrent_streams != std::numeric_limits<uint32_t>::max()) {
+        SaveUint16(p, H2_SETTINGS_MAX_CONCURRENT_STREAMS);
+        SaveUint32(p + 2, in.max_concurrent_streams);
+        p += 6;
+    }
+    if (in.stream_window_size != H2Settings::DEFAULT_INITIAL_WINDOW_SIZE) {
+        SaveUint16(p, H2_SETTINGS_STREAM_WINDOW_SIZE);
+        SaveUint32(p + 2, in.stream_window_size);
+        p += 6;
+    }
+    if (in.max_frame_size != H2Settings::DEFAULT_MAX_FRAME_SIZE) {
+        SaveUint16(p, H2_SETTINGS_MAX_FRAME_SIZE);
+        SaveUint32(p + 2, in.max_frame_size);
+        p += 6;
+    }
+    if (in.max_header_list_size != std::numeric_limits<uint32_t>::max()) {
+        SaveUint16(p, H2_SETTINGS_MAX_HEADER_LIST_SIZE);
+        SaveUint32(p + 2, in.max_header_list_size);
+        p += 6;
+    }
+    return static_cast<size_t>(p - (uint8_t*)out);
+}
+
+static size_t SerializeH2SettingsFrameAndWU(const H2Settings& in, void* out) {
+    uint8_t* p = (uint8_t*)out;
+    size_t nb = SerializeH2Settings(in, p + FRAME_HEAD_SIZE);
+    SerializeFrameHead(p, nb, H2_FRAME_SETTINGS, 0, 0);
+    p += FRAME_HEAD_SIZE + nb;
+    if (in.connection_window_size > H2Settings::DEFAULT_INITIAL_WINDOW_SIZE) {
+        SerializeFrameHead(p, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+        SaveUint32(p + FRAME_HEAD_SIZE,
+                   in.connection_window_size - H2Settings::DEFAULT_INITIAL_WINDOW_SIZE);
+        p += FRAME_HEAD_SIZE + 4;
+    }
+    return static_cast<size_t>(p - (uint8_t*)out);
+}
+
+inline bool AddWindowSize(butil::atomic<int64_t>* window_size, int64_t diff) {
+    // A sender MUST NOT allow a flow-control window to exceed 2^31 - 1.
+    // If a sender receives a WINDOW_UPDATE that causes a flow-control window 
+    // to exceed this maximum, it MUST terminate either the stream or the connection,
+    // as appropriate.
+    const int64_t before_add =
+        window_size->fetch_add(diff, butil::memory_order_relaxed);
+    const int64_t after_add = before_add + diff;
+    if (after_add > std::numeric_limits<int32_t>::max() ||
+        after_add < std::numeric_limits<int32_t>::min()) {
+        window_size->fetch_sub(diff, butil::memory_order_relaxed);
+        return false;
+    }
+    // window_size being negative is OK
+    return true;
+}
+
+static H2Context::FrameHandler s_frame_handlers[H2_FRAME_TYPE_MAX + 1];
+static pthread_once_t s_frame_handlers_init_once = PTHREAD_ONCE_INIT;
+void InitFrameHandlers() {
+    s_frame_handlers[H2_FRAME_DATA] = &H2Context::OnData;
+    s_frame_handlers[H2_FRAME_HEADERS] = &H2Context::OnHeaders;
+    s_frame_handlers[H2_FRAME_PRIORITY] = &H2Context::OnPriority;
+    s_frame_handlers[H2_FRAME_RST_STREAM] = &H2Context::OnResetStream;
+    s_frame_handlers[H2_FRAME_SETTINGS] = &H2Context::OnSettings;
+    s_frame_handlers[H2_FRAME_PUSH_PROMISE] = &H2Context::OnPushPromise;
+    s_frame_handlers[H2_FRAME_PING] = &H2Context::OnPing;
+    s_frame_handlers[H2_FRAME_GOAWAY] = &H2Context::OnGoAway;
+    s_frame_handlers[H2_FRAME_WINDOW_UPDATE] = &H2Context::OnWindowUpdate;
+    s_frame_handlers[H2_FRAME_CONTINUATION] = &H2Context::OnContinuation;
+}
+inline H2Context::FrameHandler FindFrameHandler(H2FrameType type) {
+    pthread_once(&s_frame_handlers_init_once, InitFrameHandlers);
+    if (type < 0 || type > H2_FRAME_TYPE_MAX) {
+        return nullptr;
+    }
+    return s_frame_handlers[type];
+}
+
+H2Context::H2Context(Socket* socket, const Server* server)
+    : _socket(socket)
+    , _remote_window_left(H2Settings::DEFAULT_INITIAL_WINDOW_SIZE)
+    , _conn_state(H2_CONNECTION_UNINITIALIZED)
+    , _last_received_stream_id(-1)
+    , _last_sent_stream_id(1)
+    , _goaway_stream_id(-1)
+    , _remote_settings_received(false)
+    , _client_preface_pending(false)
+    , _volatile_pending_stream_size(0)
+    , _pending_data_size(0)
+    , _last_flushed_stream_id(0)
+    , _deferred_window_update(0) {
+    // Stop printing the field which is useless for remote settings.
+    _remote_settings.connection_window_size = 0;
+    // SETTINGS_INITIAL_WINDOW_SIZE defaults to 65535 until the peer sends a
+    // different value. Larger requests are resumed by WINDOW_UPDATE.
+    _remote_settings.stream_window_size = H2Settings::DEFAULT_INITIAL_WINDOW_SIZE;
+    // RFC 7540 section 6.5.2: the peer's SETTINGS_MAX_CONCURRENT_STREAMS
+    // defaults to unlimited until its SETTINGS frame is received.
+    _remote_settings.max_concurrent_streams =
+        std::numeric_limits<uint32_t>::max();
+    if (server) {
+        _unack_local_settings = server->options().h2_settings;
+    } else {
+        _unack_local_settings.header_table_size = FLAGS_h2_client_header_table_size;
+        _unack_local_settings.stream_window_size = FLAGS_h2_client_stream_window_size;
+        _unack_local_settings.max_frame_size = FLAGS_h2_client_max_frame_size;
+        _unack_local_settings.connection_window_size = FLAGS_h2_client_connection_window_size;
+        _unack_local_settings.max_header_list_size =
+            FLAGS_h2_client_max_header_list_size > 0
+            ? (uint32_t)FLAGS_h2_client_max_header_list_size
+            : std::numeric_limits<uint32_t>::max();
+    }
+#if defined(UNIT_TEST)
+    // In ut, we hope _last_sent_stream_id run out quickly to test the correctness
+    // of creating new h2 socket. This value is 10,000 less than 0x7FFFFFFF.
+    _last_sent_stream_id = 0x7fffd8ef;
+#endif
+}
+
+H2Context::~H2Context() {
+    SubPendingDataSize(_pending_data_size.load(butil::memory_order_relaxed));
+    for (StreamMap::iterator it = _pending_streams.begin();
+         it != _pending_streams.end(); ++it) {
+        it->second->RemoveOneRefForStage2();
+    }
+    _pending_streams.clear();
+    _volatile_pending_stream_size.store(0, butil::memory_order_relaxed);
+}
+
+void H2Context::AddPendingDataSize(size_t n) {
+    if (n > 0) {
+        _pending_data_size.fetch_add(n, butil::memory_order_relaxed);
+        get_h2_bvars()->h2_pending_data_bytes << static_cast<int64_t>(n);
+    }
+}
+
+void H2Context::SubPendingDataSize(size_t n) {
+    if (n > 0) {
+        const size_t prev =
+            _pending_data_size.fetch_sub(n, butil::memory_order_relaxed);
+        CHECK_GE(prev, n);
+        get_h2_bvars()->h2_pending_data_bytes << -static_cast<int64_t>(n);
+    }
+}
+
+int H2Context::Init() {
+    if (_pending_streams.init(64, 70) != 0) {
+        LOG(WARNING) << "Fail to init _pending_streams";
+    }
+    if (_hpacker.Init(_unack_local_settings.header_table_size) != 0) {
+        LOG(WARNING) << "Fail to init _hpacker";
+    }
+    return 0;
+}
+
+H2Settings H2Context::remote_settings() const {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    return _remote_settings;
+}
+
+size_t H2Context::VolatilePendingStreamSize() const {
+    return _volatile_pending_stream_size.load(butil::memory_order_relaxed);
+}
+
+H2StreamContext* H2Context::RemoveStreamLocked(int stream_id) {
+    H2StreamContext* sctx = nullptr;
+    if (!_pending_streams.erase(stream_id, &sctx)) {
+        return nullptr;
+    }
+    _volatile_pending_stream_size.store(
+        _pending_streams.size(), butil::memory_order_relaxed);
+    SubPendingDataSize(sctx->_pending_data.size());
+    return sctx;
+}
+
+H2StreamContext* H2Context::RemoveStreamAndDeferWU(int stream_id) {
+    H2StreamContext* sctx = nullptr;
+    {
+        std::unique_lock<butil::Mutex> mu(_stream_mutex);
+        sctx = RemoveStreamLocked(stream_id);
+        if (sctx == nullptr) {
+            return nullptr;
+        }
+    }
+    // The remote stream will not send any more data, sending back the
+    // stream-level WINDOW_UPDATE is pointless, just move the value into
+    // the connection.
+    DeferWindowUpdate(sctx->ReleaseDeferredWindowUpdate());
+    return sctx;
+}
+
+void H2Context::RemoveGoAwayStreams(
+    int goaway_stream_id, std::vector<H2StreamContext*>* out_streams) {
+    out_streams->clear();
+    if (goaway_stream_id == 0) {  // quick path
+        StreamMap tmp;
+        {
+            std::unique_lock<butil::Mutex> mu(_stream_mutex);
+            _goaway_stream_id = goaway_stream_id;
+            _pending_streams.swap(tmp);
+            _volatile_pending_stream_size.store(0, butil::memory_order_relaxed);
+            SubPendingDataSize(
+                _pending_data_size.load(butil::memory_order_relaxed));
+        }
+        for (StreamMap::const_iterator it = tmp.begin(); it != tmp.end(); ++it) {
+            out_streams->push_back(it->second);
+        }
+    } else {
+        std::unique_lock<butil::Mutex> mu(_stream_mutex);
+        _goaway_stream_id = goaway_stream_id;
+        for (StreamMap::const_iterator it = _pending_streams.begin();
+             it != _pending_streams.end(); ++it) {
+            if (it->first > goaway_stream_id) {
+                out_streams->push_back(it->second);
+            }
+        }
+        for (size_t i = 0; i < out_streams->size(); ++i) {
+            RemoveStreamLocked((*out_streams)[i]->stream_id());
+        }
+    }
+}
+
+H2StreamContext* H2Context::FindStream(int stream_id) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    H2StreamContext** psctx = _pending_streams.seek(stream_id);
+    if (psctx) {
+        return *psctx;
+    }
+    return nullptr;
+}
+
+butil::intrusive_ptr<H2StreamContext> H2Context::FindOpenStream(int stream_id) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    H2StreamContext** psctx = _pending_streams.seek(stream_id);
+    if (psctx == nullptr) {
+        return nullptr;
+    }
+    H2StreamContext* sctx = *psctx;
+    if (is_server_side() &&
+        (sctx->_remote_ended || sctx->_rejected_error != H2_NO_ERROR)) {
+        return nullptr;
+    }
+    // SharedObject's intrusive_ptr_add_ref/intrusive_ptr_release manipulate
+    // the same reference count as AddOneRefForStage2/RemoveOneRefForStage2.
+    return butil::intrusive_ptr<H2StreamContext>(sctx);
+}
+
+butil::intrusive_ptr<H2StreamContext> H2Context::FindHeaderStream(
+    int stream_id) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    H2StreamContext** psctx = _pending_streams.seek(stream_id);
+    if (psctx == nullptr) {
+        return nullptr;
+    }
+    H2StreamContext* sctx = *psctx;
+    if (is_server_side() && sctx->_remote_ended &&
+        sctx->_rejected_error == H2_NO_ERROR) {
+        LOG(ERROR) << "Stream already ended remotely, stream_id=" << stream_id;
+        sctx->_rejected_error = H2_STREAM_CLOSED_ERROR;
+        SubPendingDataSize(sctx->_pending_data.size());
+        sctx->_pending_data.clear();
+        sctx->_pending_trailer.clear();
+    }
+    return butil::intrusive_ptr<H2StreamContext>(sctx);
+}
+
+int H2Context::TryToInsertStream(int stream_id, H2StreamContext* ctx) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    if (is_server_side() && stream_id > _last_received_stream_id) {
+        _last_received_stream_id = stream_id;
+    }
+    if (_goaway_stream_id >= 0 && stream_id > _goaway_stream_id) {
+        return 1;
+    }
+    // Enforce the SETTINGS_MAX_CONCURRENT_STREAMS value the server
+    // advertised. Use _unack_local_settings so that a client which never
+    // ACKs our SETTINGS frame cannot dodge the limit (_local_settings is
+    // only synchronized on ACK). Client-side streams are already bounded
+    // against the remote peer's setting before insertion (see
+    // H2UnsentRequest::AppendAndDestroySelf).
+    if (is_server_side() &&
+        _pending_streams.size() >= _unack_local_settings.max_concurrent_streams) {
+        return 2;
+    }
+    H2StreamContext*& sctx = _pending_streams[stream_id];
+    if (sctx == nullptr) {
+        if (is_server_side() && stream_id > _last_received_stream_id) {
+            _last_received_stream_id = stream_id;
+        }
+        // Synchronize creation with SETTINGS_INITIAL_WINDOW_SIZE updates.
+        ctx->_remote_window_left.store(_remote_settings.stream_window_size,
+                                       butil::memory_order_relaxed);
+        sctx = ctx;
+        _volatile_pending_stream_size.store(
+            _pending_streams.size(), butil::memory_order_relaxed);
+        return 0;
+    }
+    return -1;
+}
+
+ParseResult H2Context::ConsumeFrameHead(
+    butil::IOBufBytesIterator& it, H2FrameHead* frame_head) {
+    uint8_t length_buf[3];
+    size_t n = it.copy_and_forward(length_buf, sizeof(length_buf));
+    if (n < 3) {
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+    }
+    const uint32_t length = ((uint32_t)length_buf[0] << 16)
+        | ((uint32_t)length_buf[1] << 8) | length_buf[2];
+    if (length > _local_settings.max_frame_size) {
+        LOG(ERROR) << "Too large frame length=" << length << " max="
+                   << _local_settings.max_frame_size;
+        return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+    }
+    if (it.bytes_left() < FRAME_HEAD_SIZE - 3 + length) {
+        return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+    }
+    frame_head->payload_size = length;
+    frame_head->type = (H2FrameType)LoadUint8(it);
+    frame_head->flags = LoadUint8(it);
+    const uint32_t stream_id = LoadUint32(it);
+    if (stream_id & 0x80000000) {
+        LOG(ERROR) << "Invalid stream_id=" << stream_id;
+        return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+    }
+    frame_head->stream_id = static_cast<int>(stream_id);
+    return MakeMessage(nullptr);
+}
+
+ParseResult H2Context::Consume(
+    butil::IOBufBytesIterator& it, Socket* socket) {
+    if (_conn_state == H2_CONNECTION_UNINITIALIZED) {
+        if (is_server_side()) {
+            // Wait for the client connection preface prefix
+            char preface[H2_CONNECTION_PREFACE_PREFIX_SIZE];
+            const size_t n = it.copy_and_forward(preface, sizeof(preface));
+            if (memcmp(preface, H2_CONNECTION_PREFACE_PREFIX, n) != 0) {
+                return MakeParseError(PARSE_ERROR_TRY_OTHERS);
+            }
+            if (n < sizeof(preface)) {
+                return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+            }
+            _conn_state = H2_CONNECTION_READY;
+
+            char settingsbuf[FRAME_HEAD_SIZE + H2_SETTINGS_MAX_BYTE_SIZE +
+                             FRAME_HEAD_SIZE + 4/*for WU*/];
+            const size_t nb = SerializeH2SettingsFrameAndWU(_unack_local_settings, settingsbuf);
+            if (WriteAck(socket, settingsbuf, nb) != 0) {
+                LOG(WARNING) << "Fail to respond http2-client with settings to " << *socket;
+                return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+            }
+        } else {
+            _conn_state = H2_CONNECTION_READY;
+        }
+        return MakeMessage(nullptr);
+    } else if (_conn_state == H2_CONNECTION_READY) {
+        H2FrameHead frame_head;
+        ParseResult res = ConsumeFrameHead(it, &frame_head);
+        if (!res.is_ok()) {
+            return res;
+        }
+        H2Context::FrameHandler handler = FindFrameHandler(frame_head.type);
+        if (handler == nullptr) {
+            LOG(ERROR) << "Invalid frame type=" << (int)frame_head.type;
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+        H2ParseResult h2_res = (this->*handler)(it, frame_head);
+        if (h2_res.is_ok()) {
+            return MakeMessage(h2_res.message());
+        }
+        if (h2_res.stream_id()) { // send RST_STREAM
+            char rstbuf[FRAME_HEAD_SIZE + 4];
+            SerializeFrameHead(rstbuf, 4, H2_FRAME_RST_STREAM,
+                               0, h2_res.stream_id());
+            SaveUint32(rstbuf + FRAME_HEAD_SIZE, h2_res.error());
+            get_h2_bvars()->h2_stream_reset_count << 1;
+            if (WriteAck(_socket, rstbuf, sizeof(rstbuf)) != 0) {
+                LOG(WARNING) << "Fail to send RST_STREAM to " << *_socket;
+                return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+            }
+            H2StreamContext* sctx = RemoveStreamAndDeferWU(h2_res.stream_id());
+            if (sctx) {
+                if (is_server_side()) {
+                    sctx->RemoveOneRefForStage2();
+                    return MakeMessage(nullptr);
+                } else {
+                    sctx->header().set_status_code(
+                            H2ErrorToStatusCode(h2_res.error()));
+                    return MakeMessage(sctx);
+                }
+            }
+            return MakeMessage(nullptr);
+        } else { // send GOAWAY
+            char goawaybuf[FRAME_HEAD_SIZE + 8];
+            SerializeFrameHead(goawaybuf, 8, H2_FRAME_GOAWAY, 0, 0);
+            SaveUint32(goawaybuf + FRAME_HEAD_SIZE, _last_received_stream_id);
+            SaveUint32(goawaybuf + FRAME_HEAD_SIZE + 4, h2_res.error());
+            if (WriteAck(_socket, goawaybuf, sizeof(goawaybuf)) != 0) {
+                LOG(WARNING) << "Fail to send GOAWAY to " << *_socket;
+                return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+            }
+            // https://tools.ietf.org/html/rfc7540#section-5.4.1
+            // A connection error is unrecoverable: close the connection
+            // after sending GOAWAY instead of continuing to parse (and
+            // buffer) whatever the misbehaving peer keeps sending.
+            return MakeParseError(PARSE_ERROR_ABSOLUTELY_WRONG);
+        }
+    } else {
+        return MakeParseError(PARSE_ERROR_NO_RESOURCE);
+    }
+}
+
+H2ParseResult H2Context::OnHeaders(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    // HEADERS frames MUST be associated with a stream.  If a HEADERS frame
+    // is received whose stream identifier field is 0x0, the recipient MUST
+    // respond with a connection error (Section 5.4.1) of type PROTOCOL_ERROR.
+    if (frame_head.stream_id == 0) {
+        LOG(ERROR) << "Invalid stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    const bool has_padding = (frame_head.flags & H2_FLAGS_PADDED);
+    const bool has_priority = (frame_head.flags & H2_FLAGS_PRIORITY);
+    if (frame_head.payload_size <
+        (size_t)(has_priority ? 5 : 0) + (size_t)has_padding) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    uint32_t frag_size = frame_head.payload_size;
+    uint8_t pad_length = 0;
+    if (has_padding) {
+        pad_length = LoadUint8(it);
+        --frag_size;
+    }
+    if (has_priority) {
+        const uint32_t ALLOW_UNUSED stream_dep = LoadUint32(it);
+        const uint32_t ALLOW_UNUSED weight = LoadUint8(it);
+        frag_size -= 5;
+    }
+    if (frag_size < pad_length) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    frag_size -= pad_length;
+    butil::intrusive_ptr<H2StreamContext> sctx_holder;
+    H2StreamContext* sctx = nullptr;
+    if (is_server_side() &&
+        frame_head.stream_id > _last_received_stream_id) { // new stream
+        if ((frame_head.stream_id & 1) == 0) {
+            LOG(ERROR) << "stream_id=" << frame_head.stream_id
+                       << " created by client is not odd";
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        sctx = new H2StreamContext(_socket->is_read_progressive());
+        sctx->Init(this, frame_head.stream_id);
+        const int rc = TryToInsertStream(frame_head.stream_id, sctx);
+        if (rc < 0) {
+            sctx->RemoveOneRefForStage2();
+            LOG(ERROR) << "Fail to insert existing stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        } else if (rc == 2) {
+            sctx->RemoveOneRefForStage2();
+            LOG_EVERY_SECOND(WARNING)
+                << "Refused stream_id=" << frame_head.stream_id
+                << " since concurrent streams reached max_concurrent_streams="
+                << _unack_local_settings.max_concurrent_streams
+                << " on " << *_socket;
+            // A stream error (RST_STREAM) rather than a connection error:
+            // RFC 7540 section 5.1.2 requires REFUSED_STREAM (or
+            // PROTOCOL_ERROR) for streams exceeding the advertised limit,
+            // and REFUSED_STREAM lets a compliant client retry later.
+            return MakeH2Error(H2_REFUSED_STREAM, frame_head.stream_id);
+        } else if (rc > 0) {
+            sctx->RemoveOneRefForStage2();
+            return MakeH2Error(H2_REFUSED_STREAM);
+        }
+        sctx_holder.reset(sctx);
+    } else {
+        sctx_holder = FindHeaderStream(frame_head.stream_id);
+        sctx = sctx_holder.get();
+        if (sctx == nullptr) {
+            if (is_client_side()) {
+                RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+                // Ignore the message without closing the socket.
+                H2StreamContext tmp_sctx(false);
+                tmp_sctx.Init(this, frame_head.stream_id);
+                tmp_sctx.OnHeaders(it, frame_head, frag_size, pad_length);
+                return MakeH2Message(nullptr);
+            } else {
+                LOG(ERROR) << "Fail to find stream_id=" << frame_head.stream_id;
+                return MakeH2Error(H2_PROTOCOL_ERROR);
+            }
+        }
+    }
+    return sctx->OnHeaders(it, frame_head, frag_size, pad_length);
+}
+
+bool H2StreamContext::HeaderFragmentTooLarge() const {
+    return _remaining_header_fragment.size() >
+        _conn_ctx->_unack_local_settings.max_header_list_size;
+}
+
+H2ParseResult H2StreamContext::OnHeaders(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head,
+    uint32_t frag_size, uint8_t pad_length) {
+    if (_rejected_error == H2_NO_ERROR) {
+        _parsed_length += FRAME_HEAD_SIZE + frame_head.payload_size;
+#if defined(BRPC_H2_STREAM_STATE)
+        SetState(H2_STREAM_OPEN);
+#endif
+    }
+    // A new HEADERS block (which may be an initial request header set, or
+    // trailing headers on the same stream) starts here. The decoded header
+    // list budget is per header block (RFC 7540 section 10.5.1), so reset the
+    // counter; it stays cumulative across the CONTINUATION frames that finish
+    // this same block.
+    _decoded_header_list_size = 0;
+    butil::IOBufBytesIterator it2(it, frag_size);
+    if (ConsumeHeaders(it2) < 0) {
+        LOG(ERROR) << "Invalid header, frag_size=" << frag_size
+            << ", stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    const size_t nskip = frag_size - it2.bytes_left();
+    CHECK_EQ(nskip, it.forward(nskip));
+    if (it2.bytes_left()) {
+        it.append_and_forward(&_remaining_header_fragment,
+                              it2.bytes_left());
+        // A single HEADERS frame can carry more than max_header_list_size of
+        // an incomplete header field; cap it here just like CONTINUATION.
+        if (HeaderFragmentTooLarge()) {
+            LOG(ERROR) << "Accumulated header fragment exceeds"
+                          " max_header_list_size="
+                       << _conn_ctx->_unack_local_settings.max_header_list_size
+                       << ", stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_ENHANCE_YOUR_CALM);
+        }
+    }
+    it.forward(pad_length);
+    if (frame_head.flags & H2_FLAGS_END_HEADERS) {
+        if (it2.bytes_left() != 0) {
+            LOG(ERROR) << "Incomplete header: payload_size=" << frame_head.payload_size
+                << ", stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        // The whole block went through the decoder, the connection is in a
+        // consistent state again and only this stream needs to be reset.
+        if (_rejected_error != H2_NO_ERROR) {
+            return MakeH2Error(_rejected_error, stream_id());
+        }
+        if (frame_head.flags & H2_FLAGS_END_STREAM) {
+            return OnEndStream();
+        }
+        return MakeH2Message(nullptr);
+    } else {
+        if (_rejected_error == H2_NO_ERROR &&
+            (frame_head.flags & H2_FLAGS_END_STREAM)) {
+            // Delay calling OnEndStream() in OnContinuation()
+            _stream_ended = true;
+        }
+        return MakeH2Message(nullptr);
+    }
+}
+
+H2ParseResult H2Context::OnContinuation(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    butil::intrusive_ptr<H2StreamContext> sctx =
+        FindHeaderStream(frame_head.stream_id);
+    if (sctx == nullptr) {
+        if (is_client_side()) {
+            RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+            // Ignore the message without closing the socket.
+            H2StreamContext tmp_sctx(false);
+            tmp_sctx.Init(this, frame_head.stream_id);
+            tmp_sctx.OnContinuation(it, frame_head);
+            return MakeH2Message(nullptr);
+        } else {
+            LOG(ERROR) << "Fail to find stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+    }
+    return sctx->OnContinuation(it, frame_head);
+}
+
+H2ParseResult H2StreamContext::OnContinuation(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    if (_rejected_error == H2_NO_ERROR) {
+        _parsed_length += FRAME_HEAD_SIZE + frame_head.payload_size;
+    }
+    it.append_and_forward(&_remaining_header_fragment, frame_head.payload_size);
+    // A header block may span many CONTINUATION frames; ConsumeHeaders()
+    // drains complete fields, so the fragment only buffers one incomplete
+    // field, whose wire size never legitimately exceeds the decoded header
+    // list limit. Without this cap a never-completed field (e.g. a huge
+    // declared string length) accumulates unbounded memory.
+    if (HeaderFragmentTooLarge()) {
+        LOG(ERROR) << "Accumulated header fragment exceeds"
+                      " max_header_list_size="
+                   << _conn_ctx->_unack_local_settings.max_header_list_size
+                   << ", stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_ENHANCE_YOUR_CALM);
+    }
+    const size_t size = _remaining_header_fragment.size();
+    butil::IOBufBytesIterator it2(_remaining_header_fragment);
+    if (ConsumeHeaders(it2) < 0) {
+        LOG(ERROR) << "Invalid header: payload_size=" << frame_head.payload_size
+            << ", stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    _remaining_header_fragment.pop_front(size - it2.bytes_left());
+    if (frame_head.flags & H2_FLAGS_END_HEADERS) {
+        if (it2.bytes_left() != 0) {
+            LOG(ERROR) << "Incomplete header: payload_size=" << frame_head.payload_size
+                << ", stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        // See the same check in H2StreamContext::OnHeaders().
+        if (_rejected_error != H2_NO_ERROR) {
+            return MakeH2Error(_rejected_error, stream_id());
+        }
+        if (_stream_ended) {
+            return OnEndStream();
+        }
+    }
+    return MakeH2Message(nullptr);
+}
+
+H2ParseResult H2Context::OnData(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    uint32_t frag_size = frame_head.payload_size;
+    uint8_t pad_length = 0;
+    if (frame_head.flags & H2_FLAGS_PADDED) {
+        if (frag_size == 0) {
+            LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+            return MakeH2Error(H2_FRAME_SIZE_ERROR);
+        }
+        --frag_size;
+        pad_length = LoadUint8(it);
+    }
+    if (frag_size < pad_length) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    frag_size -= pad_length;
+    butil::intrusive_ptr<H2StreamContext> sctx =
+        FindOpenStream(frame_head.stream_id);
+    if (sctx == nullptr) {
+        // If a DATA frame is received whose stream is not in "open" or "half-closed (local)" state,
+        // the recipient MUST respond with a stream error (Section 5.4.2) of type STREAM_CLOSED.
+        // Ignore the message without closing the socket.
+        H2StreamContext tmp_sctx(false);
+        tmp_sctx.Init(this, frame_head.stream_id);
+        tmp_sctx.OnData(it, frame_head, frag_size, pad_length);
+        DeferWindowUpdate(tmp_sctx.ReleaseDeferredWindowUpdate());
+
+        if (is_server_side()) {
+            RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+            return MakeH2Error(H2_STREAM_CLOSED_ERROR, frame_head.stream_id);
+        } else {
+            RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+            return MakeH2Message(nullptr);
+        }
+    }
+    return sctx->OnData(it, frame_head, frag_size, pad_length);
+}
+
+H2ParseResult H2StreamContext::OnData(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head,
+    uint32_t frag_size, uint8_t pad_length) {
+    _parsed_length += FRAME_HEAD_SIZE + frame_head.payload_size;
+    butil::IOBuf data;
+    it.append_and_forward(&data, frag_size);
+    it.forward(pad_length);
+    for (size_t i = 0; i < data.backing_block_num(); ++i) {
+        const butil::StringPiece blk = data.backing_block(i);
+        if (OnBody(blk.data(), blk.size()) != 0) {
+            if (body_too_large()) {
+                return MakeH2Error(H2_ENHANCE_YOUR_CALM, stream_id());
+            }
+            LOG(ERROR) << "Fail to parse data";
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+    }
+
+    int64_t acc = frag_size +
+        _deferred_window_update.fetch_add(frag_size, butil::memory_order_relaxed);
+    int64_t quota = static_cast<int64_t>(
+        _conn_ctx->local_settings().stream_window_size /
+        (_conn_ctx->VolatilePendingStreamSize() + 1));
+    // Allocate the quota of the window to each stream.
+    if (acc >= quota) {
+        if (acc > _conn_ctx->local_settings().stream_window_size) {
+            LOG(ERROR) << "Fail to satisfy the stream-level flow control policy";
+            return MakeH2Error(H2_FLOW_CONTROL_ERROR, frame_head.stream_id);
+        }
+        // Rarely happen for small messages.
+        const int64_t stream_wu =
+            _deferred_window_update.exchange(0, butil::memory_order_relaxed);
+        
+        if (stream_wu > 0) {
+            char winbuf[(FRAME_HEAD_SIZE + 4) * 2];
+            char* p = winbuf;
+
+            SerializeFrameHead(p, 4, H2_FRAME_WINDOW_UPDATE, 0, stream_id());
+            SaveUint32(p + FRAME_HEAD_SIZE, stream_wu);
+            p += FRAME_HEAD_SIZE + 4;
+
+            const int64_t conn_wu = stream_wu + _conn_ctx->ReleaseDeferredWindowUpdate();
+            SerializeFrameHead(p, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+            SaveUint32(p + FRAME_HEAD_SIZE, conn_wu);
+            if (WriteAck(_conn_ctx->_socket, winbuf, sizeof(winbuf)) != 0) {
+                LOG(WARNING) << "Fail to send WINDOW_UPDATE to " << *_conn_ctx->_socket;
+                return MakeH2Error(H2_INTERNAL_ERROR);
+            }
+        }
+    }
+    if (frame_head.flags & H2_FLAGS_END_STREAM) {
+        return OnEndStream();
+    }
+    return MakeH2Message(nullptr);
+}
+
+H2ParseResult H2Context::OnResetStream(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    if (frame_head.payload_size != 4) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    const H2Error h2_error = static_cast<H2Error>(LoadUint32(it));
+    H2StreamContext* sctx = RemoveStreamAndDeferWU(frame_head.stream_id);
+    if (sctx == nullptr) {
+        RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+        return MakeH2Message(nullptr);
+    }
+    return sctx->OnResetStream(h2_error, frame_head);
+}
+
+H2ParseResult H2StreamContext::OnResetStream(
+    H2Error h2_error, const H2FrameHead& frame_head) {
+    _parsed_length += FRAME_HEAD_SIZE + frame_head.payload_size;
+#if defined(BRPC_H2_STREAM_STATE)
+    if (state() == H2_STREAM_OPEN) {
+        SetState(H2_STREAM_HALF_CLOSED_REMOTE);
+    } else if (state() == H2_STREAM_HALF_CLOSED_LOCAL ||
+               state() == H2_STREAM_HALF_CLOSED_REMOTE) {
+        SetState(H2_STREAM_CLOSED);
+    } else {
+        LOG(ERROR) << "Invalid state=" << H2StreamState2Str(_state)
+                   << " in stream_id=" << stream_id();
+        RemoveOneRefForStage2();
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+#endif
+    get_h2_bvars()->h2_stream_reset_count << 1;
+    if (_conn_ctx->is_client_side()) {
+        _rst_received = true;
+        _rst_error = h2_error;
+        header().set_status_code(H2ErrorToStatusCode(h2_error));
+        return MakeH2Message(this);
+    } else {
+        // No need to process the request. Release _pending_streams's ref.
+        RemoveOneRefForStage2();
+        return MakeH2Message(nullptr);
+    }
+}
+
+H2ParseResult H2StreamContext::OnEndStream() {
+#if defined(BRPC_H2_STREAM_STATE)
+    if (state() == H2_STREAM_OPEN) {
+        SetState(H2_STREAM_HALF_CLOSED_REMOTE);
+    } else if (state() == H2_STREAM_HALF_CLOSED_LOCAL) {
+        SetState(H2_STREAM_CLOSED);
+    } else {
+        LOG(ERROR) << "Invalid state=" << H2StreamState2Str(_state)
+                   << " in stream_id=" << stream_id();
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+#endif
+    if (_conn_ctx->is_client_side()) {
+        H2StreamContext* sctx = _conn_ctx->RemoveStreamAndDeferWU(stream_id());
+        if (sctx == nullptr) {
+            RPC_VLOG << "Fail to find stream_id=" << stream_id();
+            return MakeH2Message(nullptr);
+        }
+        CHECK_EQ(sctx, this);
+
+        OnMessageComplete();
+        return MakeH2Message(sctx);
+    } else {
+        if (_remote_ended) {
+            LOG(ERROR) << "Stream already ended remotely in stream_id=" << stream_id();
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        _remote_ended = true;
+        _conn_ctx->DeferWindowUpdate(ReleaseDeferredWindowUpdate());
+        // Retain sctx in _pending_streams until the response is sent so that
+        // stream-level flow control and WINDOW_UPDATE work for server responses.
+        // AddOneRefForStage2() adds the reference consumed by ProcessHttpRequest
+        // (used purely for refcounting; _is_stage2 is only read by HTTP/1.x).
+        AddOneRefForStage2();
+        OnMessageComplete();
+        return MakeH2Message(this);
+    }
+}
+
+H2ParseResult H2Context::OnSettings(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    // SETTINGS frames always apply to a connection, never a single stream.
+    // The stream identifier for a SETTINGS frame MUST be zero (0x0).  If an
+    // endpoint receives a SETTINGS frame whose stream identifier field is
+    // anything other than 0x0, the endpoint MUST respond with a connection
+    // error (Section 5.4.1) of type PROTOCOL_ERROR.
+    if (frame_head.stream_id != 0) {
+        LOG(ERROR) << "Invalid stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    if (frame_head.flags & H2_FLAGS_ACK) {
+        if (frame_head.payload_size != 0) {
+            LOG(ERROR) << "Non-zero payload_size=" << frame_head.payload_size
+                       << " for settings-ACK";
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        _local_settings = _unack_local_settings;
+        return MakeH2Message(nullptr);
+    }
+    int64_t window_diff = 0;
+    {
+        std::unique_lock<butil::Mutex> mu(_stream_mutex);
+        const int64_t old_stream_window_size =
+            _remote_settings.stream_window_size;
+        if (!ParseH2Settings(&_remote_settings, it, frame_head.payload_size)) {
+            LOG(ERROR) << "Fail to parse from SETTINGS";
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        _remote_settings_received = true;
+        window_diff = static_cast<int64_t>(_remote_settings.stream_window_size)
+            - old_stream_window_size;
+        if (window_diff) {
+            // SETTINGS_INITIAL_WINDOW_SIZE changes all existing stream windows,
+            // but never the connection-level flow-control window.
+            for (StreamMap::const_iterator it = _pending_streams.begin();
+                 it != _pending_streams.end(); ++it) {
+                if (!AddWindowSize(&it->second->_remote_window_left,
+                                   window_diff)) {
+                    return MakeH2Error(H2_FLOW_CONTROL_ERROR);
+                }
+            }
+        }
+    }
+    // Respond with ack
+    char headbuf[FRAME_HEAD_SIZE];
+    SerializeFrameHead(headbuf, 0, H2_FRAME_SETTINGS, H2_FLAGS_ACK, 0);
+    if (WriteAck(_socket, headbuf, sizeof(headbuf)) != 0) {
+        LOG(WARNING) << "Fail to respond settings with ack to " << *_socket;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    if (window_diff > 0 && !FlushPendingData(0)) {
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    return MakeH2Message(nullptr);
+}
+
+H2ParseResult H2Context::OnPriority(
+    butil::IOBufBytesIterator&, const H2FrameHead&) {
+    LOG(ERROR) << "Not support PRIORITY frame yet";
+    return MakeH2Error(H2_PROTOCOL_ERROR);
+}
+
+H2ParseResult H2Context::OnPushPromise(
+    butil::IOBufBytesIterator&, const H2FrameHead&) {
+    LOG(ERROR) << "Not support PUSH_PROMISE frame yet";
+    return MakeH2Error(H2_PROTOCOL_ERROR);
+}
+
+H2ParseResult H2Context::OnPing(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    if (frame_head.payload_size != 8) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    if (frame_head.stream_id != 0) {
+        LOG(ERROR) << "Invalid stream_id=" << frame_head.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    if (frame_head.flags & H2_FLAGS_ACK) {
+        return MakeH2Message(nullptr);
+    }
+    
+    char pongbuf[FRAME_HEAD_SIZE + 8];
+    SerializeFrameHead(pongbuf, 8, H2_FRAME_PING, H2_FLAGS_ACK, 0);
+    it.copy_and_forward(pongbuf + FRAME_HEAD_SIZE, 8);
+    if (WriteAck(_socket, pongbuf, sizeof(pongbuf)) != 0) {
+        LOG(WARNING) << "Fail to send ack of PING to " << *_socket;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    return MakeH2Message(nullptr);
+}
+
+static void* ProcessHttpResponseWrapper(void* void_arg) {
+    ProcessHttpResponse(static_cast<InputMessageBase*>(void_arg));
+    return nullptr;
+}
+
+H2ParseResult H2Context::OnGoAway(
+    butil::IOBufBytesIterator& it, const H2FrameHead& h) {
+    if (h.payload_size < 8) {
+        LOG(ERROR) << "Invalid payload_size=" << h.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    if (h.stream_id != 0) {
+        LOG(ERROR) << "Invalid stream_id=" << h.stream_id;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    if (h.flags) {
+        LOG(ERROR) << "Invalid flags=" << h.flags;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    // Last-Stream-ID and Error Code precede the Additional Debug Data.
+    // The reserved bit of Last-Stream-ID is ignored on receipt.
+    const int last_stream_id = static_cast<int>(LoadUint32(it) & 0x7FFFFFFF);
+    const H2Error ALLOW_UNUSED h2_error = static_cast<H2Error>(LoadUint32(it));
+    // Skip Additional Debug Data
+    it.forward(h.payload_size - 8);
+    // TODO(zhujiashun): client and server should unify the code.
+    // Server Push is not supported so it works fine now.
+    if (is_client_side()) {
+        // The socket will not be selected for further requests.
+        _socket->SetLogOff();
+
+        std::vector<H2StreamContext*> goaway_streams;
+        RemoveGoAwayStreams(last_stream_id, &goaway_streams);
+        if (goaway_streams.empty()) {
+            return MakeH2Message(nullptr);
+        }
+        for (size_t i = 0; i < goaway_streams.size(); ++i) {
+            H2StreamContext* sctx = goaway_streams[i];
+            sctx->header().set_status_code(HTTP_STATUS_SERVICE_UNAVAILABLE);
+        }
+        for (size_t i = 1; i < goaway_streams.size(); ++i) {
+            bthread_t th;
+            bthread_attr_t tmp = (FLAGS_usercode_in_pthread ?
+                                  BTHREAD_ATTR_PTHREAD :
+                                  BTHREAD_ATTR_NORMAL);
+            tmp.keytable_pool = _socket->keytable_pool();
+            CHECK_EQ(0, bthread_start_background(&th, &tmp, ProcessHttpResponseWrapper,
+                         static_cast<InputMessageBase*>(goaway_streams[i])));
+        }
+        return MakeH2Message(goaway_streams[0]);
+    } else {
+        // server serves requests on-demand, ignoring GOAWAY is OK.
+        return MakeH2Message(nullptr);
+    }
+}
+                          
+H2ParseResult H2Context::OnWindowUpdate(
+    butil::IOBufBytesIterator& it, const H2FrameHead& frame_head) {
+    if (frame_head.payload_size != 4) {
+        LOG(ERROR) << "Invalid payload_size=" << frame_head.payload_size;
+        return MakeH2Error(H2_FRAME_SIZE_ERROR);
+    }
+    const uint32_t inc = LoadUint32(it);
+    if ((inc & 0x80000000) || (inc == 0)) {
+        LOG(ERROR) << "Invalid window_size_increment=" << inc;
+        return MakeH2Error(H2_PROTOCOL_ERROR);
+    }
+    if (frame_head.stream_id == 0) {
+        {
+            std::unique_lock<butil::Mutex> mu(_stream_mutex);
+            if (!AddWindowSize(&_remote_window_left, inc)) {
+                LOG(ERROR) << "Invalid connection-level window_size_increment=" << inc;
+                return MakeH2Error(H2_FLOW_CONTROL_ERROR);
+            }
+        }
+        if (!FlushPendingData(0)) {
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        return MakeH2Message(nullptr);
+    } else {
+        {
+            std::unique_lock<butil::Mutex> mu(_stream_mutex);
+            H2StreamContext** psctx = _pending_streams.seek(frame_head.stream_id);
+            if (psctx == nullptr) {
+                RPC_VLOG << "Fail to find stream_id=" << frame_head.stream_id;
+                return MakeH2Message(nullptr);
+            }
+            if (!AddWindowSize(&(*psctx)->_remote_window_left, inc)) {
+                LOG(ERROR) << "Invalid stream-level window_size_increment=" << inc
+                    << " to remote_window_left="
+                    << (*psctx)->_remote_window_left.load(butil::memory_order_relaxed);
+                return MakeH2Error(H2_FLOW_CONTROL_ERROR, frame_head.stream_id);
+            }
+        }
+        if (!FlushPendingData(frame_head.stream_id)) {
+            return MakeH2Error(H2_PROTOCOL_ERROR);
+        }
+        return MakeH2Message(nullptr);
+    }
+}
+
+void H2Context::Describe(std::ostream& os, const DescribeOptions& opt) const {
+    H2Settings remote_settings;
+    bool remote_settings_received = false;
+    int last_received_stream_id = -1;
+    size_t pending_stream_size = 0;
+    size_t pending_data_size = 0;
+    {
+        std::unique_lock<butil::Mutex> mu(_stream_mutex);
+        remote_settings = _remote_settings;
+        remote_settings_received = _remote_settings_received;
+        last_received_stream_id = _last_received_stream_id;
+        pending_stream_size = _pending_streams.size();
+        pending_data_size = _pending_data_size.load(butil::memory_order_relaxed);
+    }
+    if (opt.verbose) {
+        os << '\n';
+    }
+    const char sep = (opt.verbose ? '\n' : ' ');
+    os << "conn_state=" << H2ConnectionState2Str(_conn_state);
+    os << sep << "last_received_stream_id=" << last_received_stream_id
+       << sep << "last_sent_stream_id=" << _last_sent_stream_id;
+    os << sep << "deferred_window_update="
+       << _deferred_window_update.load(butil::memory_order_relaxed)
+       << sep << "remote_conn_window_left="
+       << _remote_window_left.load(butil::memory_order_relaxed)
+       << sep << "remote_settings=" << remote_settings
+       << sep << "remote_settings_received=" << remote_settings_received
+       << sep << "local_settings=" << _local_settings
+       << sep << "hpacker={";
+    IndentingOStream os2(os, 2);
+    _hpacker.Describe(os2, opt);
+    os << '}';
+    size_t abandoned_size = 0;
+    {
+        BAIDU_SCOPED_LOCK(_abandoned_streams_mutex);
+        abandoned_size = _abandoned_streams.size();
+    }
+    os << sep << "abandoned_streams=" << abandoned_size
+       << sep << "pending_streams=" << pending_stream_size
+       << sep << "pending_data_size=" << pending_data_size;
+    if (opt.verbose) {
+        os << '\n';
+    }
+}
+
+inline int64_t H2Context::ReleaseDeferredWindowUpdate() {
+    if (_deferred_window_update.load(butil::memory_order_relaxed) == 0) {
+        return 0;
+    }
+    return _deferred_window_update.exchange(0, butil::memory_order_relaxed);
+}
+
+void H2Context::DeferWindowUpdate(int64_t size) {
+    if (size <= 0) {
+        return;
+    }
+    const int64_t acc = _deferred_window_update.fetch_add(size, butil::memory_order_relaxed) + size;
+    if (acc >= local_settings().stream_window_size / 2) {
+        // Rarely happen for small messages.
+        const int64_t conn_wu = _deferred_window_update.exchange(0, butil::memory_order_relaxed);
+        if (conn_wu > 0) {
+            char winbuf[FRAME_HEAD_SIZE + 4];
+            SerializeFrameHead(winbuf, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+            SaveUint32(winbuf + FRAME_HEAD_SIZE, conn_wu);
+            if (WriteAck(_socket, winbuf, sizeof(winbuf)) != 0) {
+                LOG(WARNING) << "Fail to send WINDOW_UPDATE";
+                // Retry on a later DATA frame instead of silently losing
+                // the window bytes (the peer would stall otherwise).
+                _deferred_window_update.fetch_add(
+                    conn_wu, butil::memory_order_relaxed);
+            }
+        }
+    }
+}
+
+#if defined(BRPC_PROFILE_H2)
+bvar::Adder<int64_t> g_parse_time;
+bvar::PerSecond<bvar::Adder<int64_t> > g_parse_time_per_second(
+    "h2_parse_second", &g_parse_time);
+#endif
+
+ParseResult ParseH2Message(butil::IOBuf *source, Socket *socket,
+                           bool read_eof, const void *arg) {
+#if defined(BRPC_PROFILE_H2)
+    bvar::ScopedTimer<bvar::Adder<int64_t> > tm(g_parse_time);
+#endif
+    H2Context* ctx = static_cast<H2Context*>(socket->parsing_context());
+    if (ctx == nullptr) {
+        if (read_eof || source->empty()) {
+            return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
+        }
+        const Server* server = static_cast<const Server*>(arg);
+        ctx = new H2Context(socket, server);
+        if (ctx->Init() != 0) {
+            delete ctx;
+            LOG(ERROR) << "Fail to init H2Context";
+            return MakeParseError(PARSE_ERROR_NO_RESOURCE);
+        }
+        socket->initialize_parsing_context(&ctx);
+    }
+    butil::IOBufBytesIterator it(*source);
+    size_t last_bytes_left = it.bytes_left();
+    CHECK_EQ(last_bytes_left, source->size());
+    while (true) {
+        ParseResult res = ctx->Consume(it, socket);
+        if (res.is_ok()) {
+            last_bytes_left = it.bytes_left();
+            if (res.message() == nullptr) {
+                // no message to process, continue parsing.
+                continue;
+            }
+        }
+        source->pop_front(source->size() - last_bytes_left);
+        ctx->ClearAbandonedStreams();
+        return res;
+    }
+}
+
+void H2Context::AddAbandonedStream(uint32_t stream_id) {
+    std::unique_lock<butil::Mutex> mu(_abandoned_streams_mutex);
+    _abandoned_streams.push_back(stream_id);
+}
+
+inline void H2Context::ClearAbandonedStreams() {
+    std::unique_lock<butil::Mutex> mu(_abandoned_streams_mutex);
+    while (!_abandoned_streams.empty()) {
+        const uint32_t stream_id = _abandoned_streams.back();
+        _abandoned_streams.pop_back();
+        mu.unlock();
+        H2StreamContext* sctx = RemoveStreamAndDeferWU(stream_id);
+        if (sctx != nullptr) {
+            sctx->RemoveOneRefForStage2();
+        }
+        mu.lock();
+    }
+}
+
+H2StreamContext::H2StreamContext(bool read_body_progressively)
+    : HttpContext(read_body_progressively)
+    , _conn_ctx(nullptr)
+#if defined(BRPC_H2_STREAM_STATE)
+    , _state(H2_STREAM_IDLE)
+#endif
+    , _stream_id(0)
+    , _stream_ended(false)
+    , _remote_ended(false)
+    , _response_committed(false)
+    , _rst_received(false)
+    , _rst_error(H2_NO_ERROR)
+    , _remote_window_left(0)
+    , _deferred_window_update(0)
+    , _correlation_id(INVALID_BTHREAD_ID.value)
+    , _decoded_header_list_size(0)
+    , _rejected_error(H2_NO_ERROR)
+    , _deferred_response_id(INVALID_BTHREAD_ID.value) {
+    header().set_version(2, 0);
+    get_h2_bvars()->h2_stream_context_count << 1;
+}
+
+int H2StreamContext::OnSocketFailed(bthread_id_t id, void* data, int error_code) {
+    butil::intrusive_ptr<H2StreamContext> sctx(
+        static_cast<H2StreamContext*>(data), false);
+    sctx->_deferred_response_id.store(
+        INVALID_BTHREAD_ID.value, butil::memory_order_release);
+    SocketUniquePtr sock(std::move(sctx->_deferred_response_sock));
+    if (sock != NULL) {
+        sock->ReleaseIdleFailRef();
+    }
+    int rc = 0;
+    if (error_code != 0 && sctx->_conn_ctx != NULL) {
+        H2StreamContext* removed =
+            sctx->_conn_ctx->RemoveStreamAndDeferWU(sctx->stream_id());
+        if (removed != NULL) {
+            if (sock != NULL && !sock->Failed()) {
+                // Socket::NotifyOnFailed() failed to register `id' in the
+                // notification list (e.g. EAGAIN) while the Socket itself is
+                // still healthy. Return `error_code' so AppendAndDestroySelf()
+                // can explicitly reset the stream via RST_STREAM.
+                rc = error_code;
+            }
+            removed->RemoveOneRefForStage2();
+        }
+    }
+    bthread_id_unlock_and_destroy(id);
+    return rc;
+}
+
+void H2StreamContext::Init(H2Context* conn_ctx, int stream_id) {
+    _conn_ctx = conn_ctx;
+    _stream_id = stream_id;
+    _remote_window_left.store(conn_ctx->remote_settings().stream_window_size,
+                              butil::memory_order_relaxed);
+}
+
+H2StreamContext::~H2StreamContext() {
+    get_h2_bvars()->h2_stream_context_count << -1;
+}
+
+#if defined(BRPC_H2_STREAM_STATE)
+void H2StreamContext::SetState(H2StreamState state) {
+    const H2StreamState old_state = _state;
+    _state = state;
+    RPC_VLOG << "stream_id=" << stream_id() << " changed from "
+             << H2StreamState2Str(old_state) << " to "
+             << H2StreamState2Str(state);
+}
+#endif
+
+int H2StreamContext::ConsumeHeaders(butil::IOBufBytesIterator& it) {
+    HPacker& hpacker = _conn_ctx->hpacker();
+    HttpHeader& h = header();
+    // https://tools.ietf.org/html/rfc7540#section-10.5.1
+    // Bound the cumulative decoded size of the header list. Without this
+    // check nothing limits header bytes (-max_body_size covers DATA only)
+    // and 1-byte HPACK indexed references to a large dynamic-table entry
+    // amplify a small HEADERS/CONTINUATION frame ~4000x ("HPACK bomb").
+    const uint32_t max_header_list_size =
+        _conn_ctx->_unack_local_settings.max_header_list_size;
+    while (it) {
+        HPacker::Header pair;
+        const int rc = hpacker.Decode(it, &pair);
+        if (rc < 0) {
+            return -1;
+        }
+        if (rc == 0) {
+            break;
+        }
+        _decoded_header_list_size += pair.name.size() + pair.value.size() + 32;
+        if (_decoded_header_list_size > max_header_list_size) {
+            LOG(ERROR) << "Decoded header list exceeds max_header_list_size="
+                       << max_header_list_size << ", stream_id=" << _stream_id;
+            return -1;
+        }
+        if (_rejected_error != H2_NO_ERROR) {
+            // The stream is already refused, keep feeding the decoder so that
+            // the dynamic table stays in sync with the peer, but stop spending
+            // memory on fields nobody is going to read. A peer that keeps
+            // piling them up still runs into max_header_list_size above, which
+            // escalates to a connection error as it has to.
+            continue;
+        }
+        const char* const name = pair.name.c_str();
+        bool matched = false;
+        if (name[0] == ':') { // reserved names
+            switch (name[1]) {
+            case 'a':
+                if (strcmp(name + 2, /*a*/"uthority") == 0) {
+                    matched = true;
+                    h.uri().SetHostAndPort(pair.value);
+                }
+                break;
+            case 'm':
+                if (strcmp(name + 2, /*m*/"ethod") == 0) {
+                    matched = true;
+                    HttpMethod method;
+                    if (!Str2HttpMethod(pair.value.c_str(), &method)) {
+                        LOG(ERROR) << "Invalid method=" << pair.value
+                                   << ", stream_id=" << _stream_id;
+                        _rejected_error = H2_PROTOCOL_ERROR;
+                    } else {
+                        h.set_method(method);
+                    }
+                }
+                break;
+            case 'p':
+                if (strcmp(name + 2, /*p*/"ath") == 0) {
+                    matched = true;
+                    // RFC 9113 8.3.1: :path MUST NOT be empty and MUST begin
+                    // with '/', the only exception being the asterisk-form
+                    // that OPTIONS uses. '*' is accepted for any method here,
+                    // as http_parser does for HTTP/1: pinning it to OPTIONS
+                    // would take the whole header block, since HPACK does not
+                    // order pseudo-headers and :method may not have arrived.
+                    if (pair.value != "*" && (pair.value.empty() || pair.value[0] != '/')) {
+                        LOG(ERROR) << "Invalid path=" << pair.value
+                                   << ", stream_id=" << _stream_id;
+                        _rejected_error = H2_PROTOCOL_ERROR;
+                    } else if (h.uri().SetH2Path(pair.value) != 0) {
+                        // Including path/query/fragment. Fails on a CR/LF
+                        // in the value or too many query parameters.
+                        LOG(ERROR) << h.uri().status().error_cstr()
+                                   << ", stream_id=" << _stream_id;
+                        _rejected_error = H2_ENHANCE_YOUR_CALM;
+                    }
+                }
+                break;
+            case 's':
+                if (strcmp(name + 2, /*:s*/"cheme") == 0) {
+                    matched = true;
+                    h.uri().set_scheme(pair.value);
+                } else if (strcmp(name + 2, /*:s*/"tatus") == 0) {
+                    matched = true;
+                    char* endptr = nullptr;
+                    const int sc = strtol(pair.value.c_str(), &endptr, 10);
+                    if (*endptr != '\0') {
+                        LOG(ERROR) << "Invalid status=" << pair.value
+                                   << ", stream_id=" << _stream_id;
+                        _rejected_error = H2_PROTOCOL_ERROR;
+                    } else {
+                        h.set_status_code(sc);
+                    }
+                }
+                break;
+            default:
+                break;
+            }
+            if (!matched) {
+                LOG(ERROR) << "Unknown pseudo-header=`" << name
+                           << "', stream_id=" << _stream_id;
+                _rejected_error = H2_PROTOCOL_ERROR;
+            }
+        } else if (name[0] == 'c' &&
+                   strcmp(name + 1, /*c*/"ontent-type") == 0) {
+            h.set_content_type(pair.value);
+        } else {
+            h.AppendHeader(pair.name, pair.value);
+            if (FLAGS_http_max_header_count > 0 &&
+                h.HeaderCount() > FLAGS_http_max_header_count) {
+                LOG(ERROR) << "Too many headers, max="
+                           << FLAGS_http_max_header_count
+                           << ", stream_id=" << _stream_id;
+                _rejected_error = H2_ENHANCE_YOUR_CALM;
+            }
+        }
+
+        if (FLAGS_http_verbose) {
+            butil::IOBufBuilder* vs = this->_vmsgbuilder.get();
+            if (vs == nullptr) {
+                vs = new butil::IOBufBuilder;
+                this->_vmsgbuilder.reset(vs);
+                if (_conn_ctx->is_server_side()) {
+                    *vs << "[ H2 REQUEST @" << butil::my_ip() << " ]";
+                } else {
+                    *vs << "[ H2 RESPONSE @" << butil::my_ip() << " ]";
+                }
+            }
+            // print \n first to be consistent with code in http_message.cpp
+            *vs << "\n< " << pair.name << " = " << pair.value;
+        }
+    }
+    return 0;
+}
+
+const CommonStrings* get_common_strings();
+
+static void PackH2Headers(butil::IOBuf* out,
+                          butil::IOBuf& headers,
+                          int stream_id,
+                          uint32_t max_frame_size,
+                          bool end_stream) {
+    char headbuf[FRAME_HEAD_SIZE];
+    H2FrameHead headers_head = {
+        (uint32_t)headers.size(), H2_FRAME_HEADERS, 0, stream_id};
+    if (end_stream) {
+        headers_head.flags |= H2_FLAGS_END_STREAM;
+    }
+    if (headers_head.payload_size <= max_frame_size) {
+        headers_head.flags |= H2_FLAGS_END_HEADERS;
+        SerializeFrameHead(headbuf, headers_head);
+        out->append(headbuf, sizeof(headbuf));
+        out->append(butil::IOBuf::Movable(headers));
+    } else {
+        headers_head.payload_size = max_frame_size;
+        SerializeFrameHead(headbuf, headers_head);
+        out->append(headbuf, sizeof(headbuf));
+        headers.cutn(out, headers_head.payload_size);
+
+        H2FrameHead cont_head = {0, H2_FRAME_CONTINUATION, 0, stream_id};
+        while (!headers.empty()) {
+            if (headers.size() <= max_frame_size) {
+                cont_head.flags |= H2_FLAGS_END_HEADERS;
+                cont_head.payload_size = headers.size();
+            } else {
+                cont_head.payload_size = max_frame_size;
+            }
+            SerializeFrameHead(headbuf, cont_head);
+            out->append(headbuf, FRAME_HEAD_SIZE);
+            headers.cutn(out, cont_head.payload_size);
+        }
+    }
+}
+
+void H2Context::AppendPendingDataLocked(H2StreamContext* sctx,
+                                        butil::IOBuf* out) {
+    CHECK(sctx != nullptr);
+    const uint32_t max_frame_size = _remote_settings.max_frame_size;
+    char headbuf[FRAME_HEAD_SIZE];
+    while (!sctx->_pending_data.empty()) {
+        const int64_t conn_window =
+            _remote_window_left.load(butil::memory_order_relaxed);
+        const int64_t stream_window =
+            sctx->_remote_window_left.load(butil::memory_order_relaxed);
+        if (conn_window <= 0 || stream_window <= 0) {
+            break;
+        }
+        const size_t payload_size = std::min(
+            sctx->_pending_data.size(),
+            std::min(static_cast<size_t>(max_frame_size),
+                     static_cast<size_t>(std::min(conn_window, stream_window))));
+        CHECK_GT(payload_size, 0u);
+        _remote_window_left.fetch_sub(payload_size, butil::memory_order_relaxed);
+        sctx->_remote_window_left.fetch_sub(payload_size,
+                                             butil::memory_order_relaxed);
+
+        H2FrameHead data_head = {
+            static_cast<uint32_t>(payload_size), H2_FRAME_DATA, 0,
+            sctx->stream_id()};
+        if (payload_size == sctx->_pending_data.size() &&
+            sctx->_pending_trailer.empty()) {
+            data_head.flags |= H2_FLAGS_END_STREAM;
+        }
+        SerializeFrameHead(headbuf, data_head);
+        out->append(headbuf, sizeof(headbuf));
+        sctx->_pending_data.cutn(out, payload_size);
+        SubPendingDataSize(payload_size);
+    }
+    if (sctx->_pending_data.empty() && !sctx->_pending_trailer.empty()) {
+        PackH2Headers(out, sctx->_pending_trailer, sctx->stream_id(),
+                      max_frame_size, true /* end_stream */);
+        sctx->_pending_trailer.clear();
+    }
+}
+
+butil::Status H2Context::TryToInsertClientStream(
+    int stream_id, H2StreamContext* sctx, const butil::IOBuf& data,
+    butil::IOBuf* out) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    return TryToInsertClientStreamLocked(stream_id, sctx, data, out);
+}
+
+butil::Status H2Context::TryToInsertClientStreamLocked(
+    int stream_id, H2StreamContext* sctx, const butil::IOBuf& data,
+    butil::IOBuf* out) {
+    if (_goaway_stream_id >= 0 && stream_id > _goaway_stream_id) {
+        return butil::Status(ELOGOFF, "the connection just issued GOAWAY");
+    }
+    if (_pending_streams.seek(stream_id) != nullptr) {
+        return butil::Status(EINTERNAL,
+                             "Fail to insert existing stream_id");
+    }
+    if (_pending_streams.size() >= _remote_settings.max_concurrent_streams) {
+        return butil::Status(
+            ELIMIT, "Pending Stream count exceeds max concurrent stream");
+    }
+
+    const int64_t conn_window =
+        _remote_window_left.load(butil::memory_order_relaxed);
+    const int64_t stream_window = _remote_settings.stream_window_size;
+    size_t sendable_size = 0;
+    if (conn_window > 0 && stream_window > 0) {
+        sendable_size = std::min(
+            data.size(),
+            static_cast<size_t>(std::min(conn_window, stream_window)));
+    }
+    const size_t pending_size = data.size() - sendable_size;
+    const int64_t max_pending = GetH2MaxPendingDataBytes();
+    if (max_pending > 0) {
+        const auto limit = static_cast<size_t>(max_pending);
+        const size_t cur_pending =
+            _pending_data_size.load(butil::memory_order_relaxed);
+        // Check and reserve pending bytes under the same lock. Otherwise,
+        // concurrent requests may all observe available capacity before any
+        // of them adds its unsent DATA.
+        if (cur_pending > limit || pending_size > limit - cur_pending) {
+            return butil::Status(EOVERCROWDED,
+                                 "Too much pending HTTP/2 request data");
+        }
+    }
+
+    // Mutate stream and window state only after all failure checks above.
+    sctx->_conn_ctx = this;
+    sctx->_stream_id = stream_id;
+    sctx->_remote_window_left.store(stream_window,
+                                    butil::memory_order_relaxed);
+    _pending_streams[stream_id] = sctx;
+    _volatile_pending_stream_size.store(
+        _pending_streams.size(), butil::memory_order_relaxed);
+    if (!data.empty()) {
+        CHECK(sctx->_pending_data.empty());
+        sctx->_pending_data = data;
+        AddPendingDataSize(data.size());
+        AppendPendingDataLocked(sctx, out);
+    }
+    return butil::Status::OK();
+}
+
+bool H2Context::ClearPendingData(int stream_id) {
+    std::unique_lock<butil::Mutex> mu(_stream_mutex);
+    H2StreamContext** psctx = _pending_streams.seek(stream_id);
+    if (psctx == nullptr) {
+        return false;
+    }
+    const bool had_pending = !(*psctx)->_pending_data.empty() ||
+                             !(*psctx)->_pending_trailer.empty();
+    SubPendingDataSize((*psctx)->_pending_data.size());
+    (*psctx)->_pending_data.clear();
+    (*psctx)->_pending_trailer.clear();
+    return had_pending;
+}
+
+bool H2Context::PendingDataOvercrowded() const {
+    const int64_t max_pending = GetH2MaxPendingDataBytes();
+    return max_pending > 0 &&
+           _pending_data_size.load(butil::memory_order_relaxed) >=
+               static_cast<size_t>(max_pending);
+}
+
+bool H2Context::FlushPendingData(int stream_id) {
+    butil::IOBuf out;
+    std::vector<H2StreamContext*> finished_streams;
+    {
+        std::unique_lock<butil::Mutex> mu(_stream_mutex);
+        if (stream_id != 0) {
+            H2StreamContext** psctx = _pending_streams.seek(stream_id);
+            if (psctx != nullptr) {
+                H2StreamContext* sctx = *psctx;
+                if (sctx->_rejected_error == H2_NO_ERROR &&
+                    (!sctx->_pending_data.empty() ||
+                     !sctx->_pending_trailer.empty())) {
+                    AppendPendingDataLocked(sctx, &out);
+                    if (is_server_side() && sctx->_response_committed &&
+                        sctx->_pending_data.empty() &&
+                        sctx->_pending_trailer.empty()) {
+                        RemoveStreamLocked(stream_id);
+                        finished_streams.push_back(sctx);
+                    }
+                }
+            }
+        } else {
+            // Round-Robin at connection-level WINDOW_UPDATE granularity:
+            // rotate the starting stream after _last_flushed_stream_id so a
+            // lower-ID stream cannot permanently starve higher-ID streams
+            // across consecutive WINDOW_UPDATE frames.
+            std::vector<H2StreamContext*> pending_list;
+            for (StreamMap::const_iterator it = _pending_streams.begin();
+                 it != _pending_streams.end(); ++it) {
+                H2StreamContext* sctx = it->second;
+                if (sctx->_rejected_error == H2_NO_ERROR &&
+                    (!sctx->_pending_data.empty() ||
+                     !sctx->_pending_trailer.empty())) {
+                    pending_list.push_back(sctx);
+                }
+            }
+            if (pending_list.size() > 1) {
+                std::sort(pending_list.begin(), pending_list.end(),
+                          [](const H2StreamContext* a, const H2StreamContext* b) {
+                              return a->stream_id() < b->stream_id();
+                          });
+            }
+            size_t start_idx = 0;
+            for (size_t i = 0; i < pending_list.size(); ++i) {
+                if (pending_list[i]->stream_id() > _last_flushed_stream_id) {
+                    start_idx = i;
+                    break;
+                }
+            }
+            for (size_t i = 0; i < pending_list.size(); ++i) {
+                if (_remote_window_left.load(butil::memory_order_relaxed) <= 0) {
+                    break;
+                }
+                H2StreamContext* sctx =
+                    pending_list[(start_idx + i) % pending_list.size()];
+                const size_t before_size = sctx->_pending_data.size();
+                AppendPendingDataLocked(sctx, &out);
+                if (sctx->_pending_data.size() < before_size) {
+                    _last_flushed_stream_id = sctx->stream_id();
+                }
+                if (is_server_side() && sctx->_response_committed &&
+                    sctx->_pending_data.empty() &&
+                    sctx->_pending_trailer.empty()) {
+                    RemoveStreamLocked(sctx->stream_id());
+                    finished_streams.push_back(sctx);
+                }
+            }
+        }
+    }
+    const bool rc = out.empty() || WriteAck(_socket, &out) == 0;
+    for (size_t i = 0; i < finished_streams.size(); ++i) {
+        DeferWindowUpdate(finished_streams[i]->ReleaseDeferredWindowUpdate());
+        finished_streams[i]->RemoveOneRefForStage2();
+    }
+    return rc;
+}
+
+H2UnsentRequest::H2UnsentRequest(Controller* c)
+    : _nref(1)
+    , _size(0)
+    , _stream_id(0)
+    , _cntl(c) {
+    get_h2_bvars()->h2_unsent_request_count << 1;
+}
+
+H2UnsentRequest::~H2UnsentRequest() {
+    get_h2_bvars()->h2_unsent_request_count << -1;
+}
+
+H2UnsentRequest* H2UnsentRequest::New(Controller* c) {
+    const HttpHeader& h = c->http_request();
+    const CommonStrings* const common = get_common_strings();
+    const bool need_content_type = !h.content_type().empty();
+    const bool need_accept = !h.GetHeader(common->ACCEPT);
+    const bool need_user_agent = !h.GetHeader(common->USER_AGENT);
+    const std::string& user_info = h.uri().user_info();
+    const bool need_authorization =
+        (!user_info.empty() && !h.GetHeader("Authorization"));
+    const size_t maxsize = h.HeaderCount() + 4
+        + (size_t)need_content_type
+        + (size_t)need_accept
+        + (size_t)need_user_agent
+        + (size_t)need_authorization;
+    const size_t memsize = offsetof(H2UnsentRequest, _list) +
+        sizeof(HPacker::Header) * maxsize;
+    H2UnsentRequest* msg = new (malloc(memsize)) H2UnsentRequest(c);
+    // :method
+    if (h.method() == HTTP_METHOD_GET) {
+        msg->push(common->H2_METHOD, common->METHOD_GET);
+    } else if (h.method() == HTTP_METHOD_POST) {
+        msg->push(common->H2_METHOD, common->METHOD_POST);
+    } else {
+        msg->push(common->H2_METHOD) = HttpMethod2Str(h.method());
+    }
+    // :scheme
+    const std::string* scheme = &h.uri().scheme();
+    if (scheme->empty()) {
+        scheme = (c->is_ssl() ? &common->H2_SCHEME_HTTPS :
+                  &common->H2_SCHEME_HTTP);
+    }
+    msg->push(common->H2_SCHEME, *scheme);
+    // :path
+    h.uri().GenerateH2Path(&msg->push(common->H2_PATH));
+    // :authority
+    const std::string* phost = h.GetHeader("host");
+    if (phost) {
+        msg->push(common->H2_AUTHORITY) = *phost;
+    } else {
+        const URI& uri = h.uri();
+        std::string* val = &msg->push(common->H2_AUTHORITY);
+        if (!uri.host().empty()) {
+            if (uri.port() < 0) {
+                *val = uri.host();
+            } else {
+                butil::string_printf(val, "%s:%d", uri.host().c_str(), uri.port());
+            }
+        } else if (c->remote_side().port != 0) {
+            *val = butil::endpoint2str(c->remote_side()).c_str();
+        }
+    }
+    if (need_content_type) {
+        msg->push(common->CONTENT_TYPE, h.content_type());
+    }
+    if (need_accept) {
+        msg->push(common->ACCEPT, common->DEFAULT_ACCEPT);
+    }
+    if (need_user_agent) {
+        msg->push(common->USER_AGENT, common->DEFAULT_USER_AGENT);
+    }
+    if (need_authorization) {
+        // NOTE: just assume user_info is well formatted, namely
+        // "<user_name>:<password>". Users are very unlikely to add extra
+        // characters in this part and even if users did, most of them are
+        // invalid and rejected by http_parser_parse_url().
+        std::string encoded_user_info;
+        butil::Base64Encode(user_info, &encoded_user_info);
+        std::string* val = &msg->push(common->AUTHORIZATION);
+        val->reserve(6 + encoded_user_info.size());
+        val->append("Basic ");
+        val->append(encoded_user_info);
+    }
+    msg->_sctx.reset(new H2StreamContext(c->is_response_read_progressively()));
+    return msg;
+}
+
+void H2UnsentRequest::Destroy() {
+    for (size_t i = 0; i < _size; ++i) {
+        _list[i].~Header();
+    }
+    this->~H2UnsentRequest();
+    free(this);
+}
+
+struct RemoveRefOnQuit {
+    RemoveRefOnQuit(H2UnsentRequest* msg) : _msg(msg) {}
+    ~RemoveRefOnQuit() { _msg->RemoveRefManually(); }
+private:
+    DISALLOW_COPY_AND_ASSIGN(RemoveRefOnQuit);
+    H2UnsentRequest* _msg;
+};
+
+void H2UnsentRequest::DestroyStreamUserData(SocketUniquePtr& sending_sock,
+                                            Controller* cntl,
+                                            int error_code,
+                                            bool /*end_of_rpc*/) {
+    RemoveRefOnQuit deref_self(this);
+    if (sending_sock != nullptr && error_code != 0) {
+        CHECK_EQ(cntl, _cntl);
+        std::unique_lock<butil::Mutex> mu(_mutex);
+        _cntl = nullptr;
+        if (_stream_id != 0) {
+            H2Context* ctx = static_cast<H2Context*>(sending_sock->parsing_context());
+            H2StreamContext* sctx = ctx->RemoveStreamAndDeferWU(_stream_id);
+            if (sctx != NULL) {
+                // The stream is still active locally (neither completed via
+                // OnEndStream nor reset by the peer). Notify the peer with
+                // RST_STREAM(CANCEL) so it can release any retained stream
+                // or pending response DATA.
+                sctx->RemoveOneRefForStage2();
+                char rstbuf[FRAME_HEAD_SIZE + 4];
+                SerializeFrameHead(rstbuf, 4, H2_FRAME_RST_STREAM, 0, _stream_id);
+                SaveUint32(rstbuf + FRAME_HEAD_SIZE, H2_CANCEL);
+                get_h2_bvars()->h2_stream_reset_count << 1;
+                if (WriteAck(sending_sock.get(), rstbuf, sizeof(rstbuf)) != 0) {
+                    LOG(WARNING) << "Fail to send RST_STREAM to " << *sending_sock;
+                }
+            }
+        }
+    }
+}
+
+#if defined(BRPC_PROFILE_H2)
+bvar::Adder<int64_t> g_append_request_time;
+bvar::PerSecond<bvar::Adder<int64_t> > g_append_request_time_per_second(
+    "h2_append_request_second",     &g_append_request_time);
+#endif
+
+butil::Status
+H2UnsentRequest::AppendAndDestroySelf(butil::IOBuf* out, Socket* socket) {
+#if defined(BRPC_PROFILE_H2)
+    bvar::ScopedTimer<bvar::Adder<int64_t> > tm(g_append_request_time);
+#endif
+    RemoveRefOnQuit deref_self(this);
+    if (socket == nullptr) {
+        return butil::Status::OK();
+    }
+    // Although the critical section looks huge, it should rarely be contended
+    // since timeout of RPC is much larger than the delay of sending.
+    std::unique_lock<butil::Mutex> mu(_mutex);
+    if (_cntl == nullptr) {
+        return butil::Status(ECANCELED, "The RPC was already failed");
+    }
+
+    H2Context* ctx = static_cast<H2Context*>(socket->parsing_context());
+    if (ctx == nullptr) {
+        CHECK(socket->CreatedByConnect());
+        ctx = new H2Context(socket, nullptr);
+        if (ctx->Init() != 0) {
+            delete ctx;
+            return butil::Status(EINTERNAL, "Fail to init H2Context");
+        }
+        ctx->_client_preface_pending = true;
+        socket->initialize_parsing_context(&ctx);
+    }
+
+    const butil::IOBuf& request_data = _cntl->request_attachment();
+    {
+        std::unique_lock<butil::Mutex> stream_mu(ctx->_stream_mutex);
+        if (ctx->RunOutStreams()) {
+            // The RPC should be failed and retried.
+            // Note that the socket should not be SetFailed() which may affect
+            // other RPC successfully sent requests and waiting for responses.
+            LOG(WARNING) << "Fail to allocate new client stream, _last_sent_stream_id="
+                         << ctx->_last_sent_stream_id;
+            RPC_VLOG << "Fail to allocate stream_id on " << *socket
+                     << " h2req=" << (StreamUserData*)this;
+            return butil::Status(EH2RUNOUTSTREAMS, "Fail to allocate stream_id");
+        }
+        const int id = static_cast<int>(ctx->_last_sent_stream_id);
+        butil::IOBuf data_out;
+        const butil::Status st = ctx->TryToInsertClientStreamLocked(
+            id, _sctx.get(), request_data, &data_out);
+        if (!st.ok()) {
+            return st;
+        }
+
+        // Mutate connection state and HPACK dynamic table only after
+        // TryToInsertClientStreamLocked succeeds.
+        ctx->_last_sent_stream_id += 2;
+        if (ctx->_client_preface_pending) {
+            ctx->_client_preface_pending = false;
+            out->append(H2_CONNECTION_PREFACE_PREFIX,
+                        H2_CONNECTION_PREFACE_PREFIX_SIZE);
+            char settingsbuf[FRAME_HEAD_SIZE + H2_SETTINGS_MAX_BYTE_SIZE +
+                             FRAME_HEAD_SIZE + 4/*for WU*/];
+            const size_t nb = SerializeH2SettingsFrameAndWU(
+                ctx->_unack_local_settings, settingsbuf);
+            out->append(settingsbuf, nb);
+        }
+
+        HPacker& hpacker = ctx->hpacker();
+        butil::IOBufAppender appender;
+        HPackOptions options;
+        options.encode_name = FLAGS_h2_hpack_encode_name;
+        options.encode_value = FLAGS_h2_hpack_encode_value;
+        if (ctx->_remote_settings.header_table_size == 0) {
+            options.index_policy = HPACK_NEVER_INDEX_HEADER;
+        }
+        for (size_t i = 0; i < _size; ++i) {
+            hpacker.Encode(&appender, _list[i], options);
+        }
+        if (_cntl->has_http_request()) {
+            const HttpHeader& h = _cntl->http_request();
+            for (HttpHeader::HeaderIterator it = h.HeaderBegin();
+                 it != h.HeaderEnd(); ++it) {
+                HPacker::Header header(it->first, it->second);
+                hpacker.Encode(&appender, header, options);
+            }
+        }
+        butil::IOBuf frag;
+        appender.move_to(frag);
+        PackH2Headers(out, frag, id, ctx->_remote_settings.max_frame_size,
+                      request_data.empty());
+        out->append(butil::IOBuf::Movable(data_out));
+        _stream_id = id;
+        _sctx.release();
+    }
+    const int64_t conn_wu = ctx->ReleaseDeferredWindowUpdate();
+    if (conn_wu > 0) {
+        char winbuf[FRAME_HEAD_SIZE + 4];
+        SerializeFrameHead(winbuf, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+        SaveUint32(winbuf + FRAME_HEAD_SIZE, conn_wu);
+        out->append(winbuf, sizeof(winbuf));
+    }
+    return butil::Status::OK();
+}
+
+size_t H2UnsentRequest::EstimatedByteSize() {
+    size_t sz = 0;
+    for (size_t i = 0; i < _size; ++i) {
+        sz += _list[i].name.size() + _list[i].value.size() + 1;
+    }
+    std::unique_lock<butil::Mutex> mu(_mutex);
+    if (_cntl == nullptr) {
+        return 0;
+    }
+    if (_cntl->has_http_request()) {
+        const HttpHeader& h = _cntl->http_request();
+        for (HttpHeader::HeaderIterator it = h.HeaderBegin();
+             it != h.HeaderEnd(); ++it) {
+            sz += it->first.size() + it->second.size() + 1;
+        }
+    }
+    sz += _cntl->request_attachment().size();
+    return sz;
+}
+
+void H2UnsentRequest::Print(std::ostream& os) const {
+    os << "[ H2 REQUEST @" << butil::my_ip() << " ]\n";
+    for (size_t i = 0; i < _size; ++i) {
+        os << "> " << _list[i].name << " = " << _list[i].value << '\n';
+    }
+    std::unique_lock<butil::Mutex> mu(_mutex);
+    if (_cntl == nullptr) {
+        return;
+    }
+    if (_cntl->has_http_request()) {
+        const HttpHeader& h = _cntl->http_request();
+        for (HttpHeader::HeaderIterator it = h.HeaderBegin();
+             it != h.HeaderEnd(); ++it) {
+            os << "> " << it->first << " = " << it->second << '\n';
+        }
+    }
+    const butil::IOBuf* body = &_cntl->request_attachment();
+    if (!body->empty()) {
+        os << "> \n";
+    }
+    os << butil::ToPrintable(*body, FLAGS_http_verbose_max_body_length);
+
+}
+
+H2UnsentResponse::H2UnsentResponse(Controller* c, int stream_id, bool is_grpc)
+    : _size(0)
+    , _stream_id(stream_id)
+    , _http_response(c->release_http_response())
+    , _is_grpc(is_grpc) {
+    _data.swap(c->response_attachment());
+    if (is_grpc) {
+        _grpc_status = ErrorCodeToGrpcStatus(c->ErrorCode());
+        PercentEncode(c->ErrorText(), &_grpc_message);
+    }
+}
+
+H2UnsentResponse* H2UnsentResponse::New(Controller* c, int stream_id, bool is_grpc) {
+    const HttpHeader* const h = &c->http_response();
+    const CommonStrings* const common = get_common_strings();
+    const bool need_content_type = !h->content_type().empty();
+    const size_t maxsize = 1
+        + (size_t)need_content_type;
+    const size_t memsize = offsetof(H2UnsentResponse, _list) +
+        sizeof(HPacker::Header) * maxsize;
+    H2UnsentResponse* msg = new (malloc(memsize)) H2UnsentResponse(c, stream_id, is_grpc);
+    // :status
+    if (h->status_code() == 200) {
+        msg->push(common->H2_STATUS, common->STATUS_200);
+    } else {
+        butil::string_printf(&msg->push(common->H2_STATUS),
+                            "%d", h->status_code());
+    }
+    if (need_content_type) {
+        msg->push(common->CONTENT_TYPE, h->content_type());
+    }
+    return msg;
+}
+
+void H2UnsentResponse::Destroy() {
+    for (size_t i = 0; i < _size; ++i) {
+        _list[i].~Header();
+    }
+    this->~H2UnsentResponse();
+    free(this);
+}
+
+#if defined(BRPC_PROFILE_H2)
+bvar::Adder<int64_t> g_append_response_time;
+bvar::PerSecond<bvar::Adder<int64_t> > g_append_response_time_per_second(
+    "h2_append_response_second",     &g_append_response_time);
+#endif
+
+butil::Status
+H2UnsentResponse::AppendAndDestroySelf(butil::IOBuf* out, Socket* socket) {
+#if defined(BRPC_PROFILE_H2)
+    bvar::ScopedTimer<bvar::Adder<int64_t> > tm(g_append_response_time);
+#endif
+    DestroyingPtr<H2UnsentResponse> destroy_self(this);
+    if (socket == nullptr) {
+        return butil::Status::OK();
+    }
+    H2Context* ctx = static_cast<H2Context*>(socket->parsing_context());
+    if (ctx == NULL || ctx->is_client_side() || _stream_id == 0) {
+        return butil::Status::OK();
+    }
+
+    H2StreamContext* overcrowded_sctx = nullptr;
+    H2StreamContext* finished_sctx = nullptr;
+    H2StreamContext* notify_failed_sctx = nullptr;
+    bthread_id_t deferred_notify_id = INVALID_BTHREAD_ID;
+    int notify_reg_error = 0;
+    {
+        std::unique_lock<butil::Mutex> mu(ctx->_stream_mutex);
+        H2StreamContext** psctx = ctx->_pending_streams.seek(_stream_id);
+        if (psctx == nullptr || (*psctx)->_rejected_error != H2_NO_ERROR) {
+            // Stream was already reset by client, abandoned, or rejected.
+            return butil::Status::OK();
+        }
+        H2StreamContext* sctx = *psctx;
+        const int64_t conn_window =
+            ctx->_remote_window_left.load(butil::memory_order_relaxed);
+        const int64_t stream_window =
+            sctx->_remote_window_left.load(butil::memory_order_relaxed);
+        size_t sendable_size = 0;
+        if (conn_window > 0 && stream_window > 0) {
+            sendable_size = std::min(
+                _data.size(),
+                static_cast<size_t>(std::min(conn_window, stream_window)));
+        }
+        const size_t pending_size = _data.size() - sendable_size;
+        const int64_t max_pending = GetH2MaxPendingDataBytes();
+        if (max_pending > 0 && pending_size > 0) {
+            const auto limit = static_cast<size_t>(max_pending);
+            const size_t cur_pending =
+                ctx->_pending_data_size.load(butil::memory_order_relaxed);
+            if (cur_pending > limit || pending_size > limit - cur_pending) {
+                overcrowded_sctx = ctx->RemoveStreamLocked(_stream_id);
+            }
+        }
+        if (overcrowded_sctx == nullptr) {
+            HPacker& hpacker = ctx->hpacker();
+            butil::IOBufAppender appender;
+            HPackOptions options;
+            options.encode_name = FLAGS_h2_hpack_encode_name;
+            options.encode_value = FLAGS_h2_hpack_encode_value;
+            if (ctx->_remote_settings.header_table_size == 0) {
+                options.index_policy = HPACK_NEVER_INDEX_HEADER;
+            }
+            for (size_t i = 0; i < _size; ++i) {
+                hpacker.Encode(&appender, _list[i], options);
+            }
+            if (_http_response) {
+                for (HttpHeader::HeaderIterator it = _http_response->HeaderBegin();
+                     it != _http_response->HeaderEnd(); ++it) {
+                    HPacker::Header header(it->first, it->second);
+                    hpacker.Encode(&appender, header, options);
+                }
+            }
+            butil::IOBuf frag;
+            appender.move_to(frag);
+            PackH2Headers(out, frag, _stream_id,
+                          ctx->_remote_settings.max_frame_size,
+                          _data.empty() && !_is_grpc);
+
+            if (_is_grpc) {
+                HPackOptions trailer_options = options;
+                trailer_options.index_policy = HPACK_NOT_INDEX_HEADER;
+                HPacker::Header status_header(
+                    "grpc-status", butil::string_printf("%d", _grpc_status));
+                HPacker::EncodeWithoutDynamicTable(
+                    &appender, status_header, trailer_options);
+                if (!_grpc_message.empty()) {
+                    HPacker::Header msg_header("grpc-message", _grpc_message);
+                    HPacker::EncodeWithoutDynamicTable(
+                        &appender, msg_header, trailer_options);
+                }
+                appender.move_to(sctx->_pending_trailer);
+            }
+
+            sctx->_response_committed = true;
+            if (!_data.empty()) {
+                CHECK(sctx->_pending_data.empty());
+                sctx->_pending_data = _data;
+                ctx->AddPendingDataSize(_data.size());
+            }
+            ctx->AppendPendingDataLocked(sctx, out);
+            if (sctx->_pending_data.empty() && sctx->_pending_trailer.empty()) {
+                finished_sctx = ctx->RemoveStreamLocked(_stream_id);
+            } else {
+                const int rc = bthread_id_create(
+                    &deferred_notify_id, sctx, H2StreamContext::OnSocketFailed);
+                if (rc == 0) {
+                    CHECK_EQ(0, bthread_id_trylock(deferred_notify_id, NULL));
+                    // Keep the Socket alive until the deferred response finishes
+                    // draining (or the stream/connection terminates) so Server::Stop
+                    // does not reclaim the Socket while waiting for WINDOW_UPDATE.
+                    sctx->HoldDeferredResponseSocket(socket, deferred_notify_id);
+                } else {
+                    notify_reg_error = rc;
+                    notify_failed_sctx = ctx->RemoveStreamLocked(_stream_id);
+                }
+            }
+        }
+    }
+    if (deferred_notify_id != INVALID_BTHREAD_ID) {
+        socket->NotifyOnFailed(deferred_notify_id);
+        notify_reg_error = bthread_id_unlock(deferred_notify_id);
+    }
+    if (notify_failed_sctx != nullptr) {
+        ctx->DeferWindowUpdate(notify_failed_sctx->ReleaseDeferredWindowUpdate());
+        notify_failed_sctx->RemoveOneRefForStage2();
+    }
+    if (notify_reg_error != 0) {
+        LOG_EVERY_SECOND(WARNING)
+            << "Fail to register deferred HTTP/2 response notification on "
+            << *socket << ": " << berror(notify_reg_error)
+            << ", resetting stream_id=" << _stream_id;
+        char rstbuf[FRAME_HEAD_SIZE + 4];
+        SerializeFrameHead(rstbuf, 4, H2_FRAME_RST_STREAM, 0, _stream_id);
+        SaveUint32(rstbuf + FRAME_HEAD_SIZE, H2_INTERNAL_ERROR);
+        out->append(rstbuf, sizeof(rstbuf));
+        get_h2_bvars()->h2_stream_reset_count << 1;
+    }
+    if (overcrowded_sctx != nullptr) {
+        ctx->DeferWindowUpdate(overcrowded_sctx->ReleaseDeferredWindowUpdate());
+        overcrowded_sctx->RemoveOneRefForStage2();
+        LOG_EVERY_SECOND(WARNING)
+            << "Pending HTTP/2 response data on " << *socket
+            << " exceeds limit=" << GetH2MaxPendingDataBytes()
+            << ", resetting stream_id=" << _stream_id;
+        char rstbuf[FRAME_HEAD_SIZE + 4];
+        SerializeFrameHead(rstbuf, 4, H2_FRAME_RST_STREAM, 0, _stream_id);
+        SaveUint32(rstbuf + FRAME_HEAD_SIZE, H2_ENHANCE_YOUR_CALM);
+        out->append(rstbuf, sizeof(rstbuf));
+        get_h2_bvars()->h2_stream_reset_count << 1;
+        return butil::Status::OK();
+    }
+    if (finished_sctx != nullptr) {
+        ctx->DeferWindowUpdate(finished_sctx->ReleaseDeferredWindowUpdate());
+        finished_sctx->RemoveOneRefForStage2();
+    }
+    const int64_t conn_wu = ctx->ReleaseDeferredWindowUpdate();
+    if (conn_wu > 0) {
+        char winbuf[FRAME_HEAD_SIZE + 4];
+        SerializeFrameHead(winbuf, 4, H2_FRAME_WINDOW_UPDATE, 0, 0);
+        SaveUint32(winbuf + FRAME_HEAD_SIZE, conn_wu);
+        out->append(winbuf, sizeof(winbuf));
+    }
+    return butil::Status::OK();
+}
+
+size_t H2UnsentResponse::EstimatedByteSize() {
+    size_t sz = 0;
+    for (size_t i = 0; i < _size; ++i) {
+        sz += _list[i].name.size() + _list[i].value.size() + 1;
+    }
+    if (_http_response) {
+        for (HttpHeader::HeaderIterator it = _http_response->HeaderBegin();
+             it != _http_response->HeaderEnd(); ++it) {
+            sz += it->first.size() + it->second.size() + 1;
+        }
+    }
+    sz += _data.size();
+    return sz;
+}
+
+void H2UnsentResponse::Print(std::ostream& os) const {
+    os << "[ H2 RESPONSE @" << butil::my_ip() << " ]\n";
+    for (size_t i = 0; i < _size; ++i) {
+        os << "> " << _list[i].name << " = " << _list[i].value << '\n';
+    }
+    if (_http_response) {
+        for (HttpHeader::HeaderIterator it = _http_response->HeaderBegin();
+             it != _http_response->HeaderEnd(); ++it) {
+            os << "> " << it->first << " = " << it->second << '\n';
+        }
+    }
+    if (!_data.empty()) {
+        os << "> \n";
+    }
+    os << butil::ToPrintable(_data, FLAGS_http_verbose_max_body_length);
+}
+
+void PackH2Request(butil::IOBuf*,
+                   SocketMessage** user_message,
+                   uint64_t correlation_id,
+                   const google::protobuf::MethodDescriptor*,
+                   Controller* cntl,
+                   const butil::IOBuf&,
+                   const Authenticator* auth) {
+    ControllerPrivateAccessor accessor(cntl);
+    
+    HttpHeader* header = &cntl->http_request();
+    if (auth != nullptr && header->GetHeader("Authorization") == nullptr) {
+        std::string auth_data;
+        if (auth->GenerateCredential(&auth_data) != 0) {
+            return cntl->SetFailed(EREQUEST, "Fail to GenerateCredential");
+        }
+        header->SetHeader("Authorization", auth_data);
+    }
+
+    H2UnsentRequest* h2_req = dynamic_cast<H2UnsentRequest*>(accessor.get_stream_user_data());
+    CHECK(h2_req);
+    h2_req->AddRefManually();   // add ref for AppendAndDestroySelf
+    h2_req->_sctx->set_correlation_id(correlation_id);
+    *user_message = h2_req;
+    
+    if (FLAGS_http_verbose) {
+        LOG(INFO) << '\n' << *h2_req;
+    }
+}
+
+static bool IsH2SocketValid(Socket* s) {
+    H2Context* c = static_cast<H2Context*>(s->parsing_context());
+    return c == nullptr ||
+           (!c->RunOutStreams() && !c->PendingDataOvercrowded());
+}
+
+StreamUserData* H2GlobalStreamCreator::OnCreatingStream(
+        SocketUniquePtr* inout, Controller* cntl) {
+    if ((*inout)->GetAgentSocket(inout, IsH2SocketValid) != 0) {
+        cntl->SetFailed(EINTERNAL, "Fail to create agent socket");
+        return nullptr;
+    }
+
+    H2UnsentRequest* h2_req = H2UnsentRequest::New(cntl);
+    if (!h2_req) {
+        cntl->SetFailed(ENOMEM, "Fail to create H2UnsentRequest");
+        return nullptr;
+    }
+    return h2_req;
+}
+
+void H2GlobalStreamCreator::DestroyStreamCreator(Controller* cntl) {
+    // H2GlobalStreamCreator is a global singleton value.
+    // Don't delete it in this function.
+}
+
+StreamCreator* get_h2_global_stream_creator() {
+    return butil::get_leaky_singleton<H2GlobalStreamCreator>();
+}
+
+}  // namespace policy
+
+} // namespace brpc

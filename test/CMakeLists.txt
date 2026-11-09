@@ -1,0 +1,380 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+if(BUILD_FUZZ_TESTS AND NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "Fuzzing is only supported with clang")
+endif()
+
+find_package(Gperftools)
+
+add_library(brpc_test_config INTERFACE)
+target_link_libraries(brpc_test_config INTERFACE brpc_build_config)
+target_include_directories(brpc_test_config BEFORE INTERFACE
+    ${CMAKE_CURRENT_BINARY_DIR}
+    ${Protobuf_INCLUDE_DIRS})
+target_compile_definitions(brpc_test_config INTERFACE
+    UNIT_TEST
+    BVAR_NOT_LINK_DEFAULT_VARIABLES
+)
+target_compile_options(brpc_test_config INTERFACE -fno-access-control)
+if(GPERFTOOLS_INCLUDE_DIR)
+    target_include_directories(brpc_test_config INTERFACE ${GPERFTOOLS_INCLUDE_DIR})
+endif()
+
+include(CompileProto)
+set(TEST_PROTO_FILES addressbook.proto
+                     addressbook1.proto
+                     addressbook_encode_decode.proto
+                     addressbook_map.proto
+                     echo.proto
+                     grpc.proto
+                     health_check.proto
+                     iobuf.proto
+                     message.proto
+                     repeated.proto
+                     snappy_message.proto
+                     v1.proto
+                     v2.proto
+                     v3.proto)
+set(PROTOC_FLAGS ${PROTOC_FLAGS} -I${CMAKE_SOURCE_DIR}/src)
+compile_proto(PROTO_HDRS PROTO_SRCS ${CMAKE_CURRENT_BINARY_DIR}
+                                    ${CMAKE_CURRENT_SOURCE_DIR}
+                                    "${TEST_PROTO_FILES}")
+add_library(TEST_PROTO_LIB OBJECT ${PROTO_SRCS} ${PROTO_HDRS})
+target_link_libraries(TEST_PROTO_LIB PRIVATE brpc_test_config)
+
+set(BRPC_SYSTEM_GTEST_SOURCE_DIR "" CACHE PATH "System googletest source directory.")
+
+if(DOWNLOAD_GTEST)
+    include(SetupGtest)
+    set(BRPC_GTEST_SOURCE_DIR "${PROJECT_BINARY_DIR}/googletest-src")
+elseif(BRPC_SYSTEM_GTEST_SOURCE_DIR)
+    add_subdirectory("${BRPC_SYSTEM_GTEST_SOURCE_DIR}" "${PROJECT_BINARY_DIR}/system-googletest-build")
+    set(BRPC_GTEST_SOURCE_DIR "${BRPC_SYSTEM_GTEST_SOURCE_DIR}")
+else()
+    message(FATAL_ERROR "Googletest is not available")
+endif()
+
+# Keep the selected headers ahead of unrelated -I paths. The original GTest
+# include directories can be marked SYSTEM by its own targets.
+set(BRPC_GTEST_INCLUDE_DIR "${CMAKE_CURRENT_BINARY_DIR}/selected-googletest-include")
+file(REMOVE_RECURSE "${BRPC_GTEST_INCLUDE_DIR}")
+file(MAKE_DIRECTORY "${BRPC_GTEST_INCLUDE_DIR}")
+file(COPY
+    "${BRPC_GTEST_SOURCE_DIR}/googletest/include/"
+    "${BRPC_GTEST_SOURCE_DIR}/googlemock/include/"
+    DESTINATION "${BRPC_GTEST_INCLUDE_DIR}")
+target_include_directories(brpc_test_config BEFORE INTERFACE "${BRPC_GTEST_INCLUDE_DIR}")
+
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/cert1.key DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/cert2.key DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/cert1.crt DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/cert2.crt DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/jsonout DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/run_tests.sh DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+
+SET(TEST_BUTIL_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/abalist_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/aligned_memory_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/at_exit_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/atomicops_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/baidu_thread_local_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/baidu_time_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/base64_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/base64url_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/big_endian_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/bits_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/bounded_queue_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/butil_unittest_main.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cacheline_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/cancellation_flag_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/class_name_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/condition_variable_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/cpu_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/crash_logging_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/crc32c_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/dir_reader_posix_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/endpoint_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/environment_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/errno_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/fd_guard_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_descriptor_shuffle_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_path_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_util_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/file_watcher_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/find_cstr_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/flat_map_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/guid_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/hash_tables_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/hash_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/iobuf_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/lazy_instance_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/leak_tracker_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/linked_list_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/linked_ptr_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/lock_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/logging_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/mpsc_queue_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/mru_cache_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/non_thread_safe_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/nullable_string16_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/object_pool_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/resource_pool_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/observer_list_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/optional_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/platform_thread_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/popen_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/rand_util_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/recordio_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/ref_counted_memory_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/ref_counted_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/safe_numerics_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/safe_sprintf_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scope_guard_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_clear_errno_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_generic_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_locale.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_lock_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_ptr_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_temp_dir_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/scoped_vector_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/security_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/seqlock_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sha1_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/simple_thread_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/singleton_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/small_map_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/stack_container_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/stack_trace_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/status_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/stl_util_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string16_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_number_conversions_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_piece_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_printf_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_split_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_splitter_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_tokenizer_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/string_util_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/stringize_macros_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/stringprintf_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/synchronous_event_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sys_string_conversions_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/temp_file_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_switches.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_checker_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_collision_warner_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_id_name_manager_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_key_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_local_storage_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/thread_local_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/time_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/type_traits_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/unique_ptr_unittest.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/utf_offset_string_conversions_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/utf_string_conversions_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/version_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/waitable_event_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/watchdog_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/weak_ptr_unittest.cc
+	)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+SET(TEST_BUTIL_SOURCES ${TEST_BUTIL_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/proc_maps_linux_unittest.cc
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_file_util_linux.cc)
+endif()
+
+# bthread_* functions are used in logging.cc, and they need to be marked as
+# weak symbols explicitly in Darwin system.
+if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(DYNAMIC_LIB ${DYNAMIC_LIB} "-Wl,-U,_bthread_getspecific"
+                                   "-Wl,-U,_bthread_setspecific"
+                                   "-Wl,-U,_bthread_key_create"
+                                   "-Wl,-U,_bthread_self"
+                                   "-Wl,-U,_bthread_timed_connect"
+    )
+endif()
+
+# Read module-owned sources from their targets, not parent-scope variables.
+get_target_property(BUTIL_SOURCES BUTIL_LIB SOURCES)
+# Source properties are directory-scoped; reuse production CRC32C settings.
+get_target_property(butil_crc32c_options BUTIL_LIB BRPC_CRC32C_COMPILE_OPTIONS)
+if(butil_crc32c_options)
+    set_property(SOURCE ${CMAKE_CURRENT_SOURCE_DIR}/../src/butil/crc32c.cc
+        APPEND PROPERTY COMPILE_OPTIONS ${butil_crc32c_options})
+endif()
+get_target_property(BVAR_SOURCES BVAR_LIB SOURCES)
+set(SOURCES)
+foreach(component BVAR BTHREAD JSON2PB MCPACK2PB BRPC)
+    get_target_property(component_sources ${component}_LIB SOURCES)
+    list(APPEND SOURCES ${component_sources})
+endforeach()
+
+add_library(BUTIL_DEBUG_LIB OBJECT ${BUTIL_SOURCES})
+add_library(SOURCES_DEBUG_LIB OBJECT ${SOURCES})
+add_dependencies(SOURCES_DEBUG_LIB PROTO_LIB)
+target_link_libraries(BUTIL_DEBUG_LIB PRIVATE brpc_test_config)
+target_link_libraries(SOURCES_DEBUG_LIB PRIVATE brpc_test_config brpc_leveldb)
+
+# shared library needs POSITION_INDEPENDENT_CODE
+set_property(TARGET ${BUTIL_DEBUG_LIB} PROPERTY POSITION_INDEPENDENT_CODE 1)
+set_property(TARGET ${SOURCES_DEBUG_LIB} PROPERTY POSITION_INDEPENDENT_CODE 1)
+
+add_library(brpc-shared-debug SHARED $<TARGET_OBJECTS:BUTIL_DEBUG_LIB>
+                                     $<TARGET_OBJECTS:SOURCES_DEBUG_LIB>
+                                     $<TARGET_OBJECTS:PROTO_LIB>)
+# change the debug lib output dir to be different from the release output
+set_target_properties(brpc-shared-debug PROPERTIES
+         LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/test)
+
+target_link_libraries(brpc-shared-debug PUBLIC brpc_test_config ${DYNAMIC_LIB})
+
+# AddressSanitizer is incompatible with tcmalloc/gperftools, do not link it when WITH_ASAN is on
+if(WITH_ASAN)
+    set(GPERFTOOLS_LIBRARIES "")
+endif()
+
+# test_butil
+add_executable(test_butil ${TEST_BUTIL_SOURCES}
+                          ${CMAKE_CURRENT_BINARY_DIR}/iobuf.pb.cc)
+target_link_libraries(test_butil PRIVATE
+    brpc-shared-debug
+    gtest
+    ${GPERFTOOLS_LIBRARIES})
+
+add_test(NAME test_butil COMMAND test_butil)
+
+# test_bvar
+# -DBVAR_NOT_LINK_DEFAULT_VARIABLES not work for gcc >= 5.0, just remove the file to prevent linking into unit tests
+get_filename_component(bvar_default_variables
+    "${CMAKE_CURRENT_SOURCE_DIR}/../src/bvar/default_variables.cpp" ABSOLUTE)
+list(REMOVE_ITEM BVAR_SOURCES ${bvar_default_variables})
+
+add_library(BVAR_DEBUG_LIB OBJECT ${BVAR_SOURCES})
+target_link_libraries(BVAR_DEBUG_LIB PRIVATE brpc_test_config)
+file(GLOB TEST_BVAR_SRCS "bvar_*_unittest.cpp")
+add_executable(test_bvar ${TEST_BVAR_SRCS}
+                         $<TARGET_OBJECTS:BVAR_DEBUG_LIB>
+                         $<TARGET_OBJECTS:BUTIL_DEBUG_LIB>)
+target_link_libraries(test_bvar PRIVATE
+    gtest
+    brpc_test_config
+    ${GPERFTOOLS_LIBRARIES}
+    ${DYNAMIC_LIB})
+add_test(NAME test_bvar COMMAND test_bvar)
+
+# bthread tests
+file(GLOB BTHREAD_UNITTESTS "bthread*unittest.cpp")
+foreach(BTHREAD_UT ${BTHREAD_UNITTESTS})
+    get_filename_component(BTHREAD_UT_WE ${BTHREAD_UT} NAME_WE)
+    add_executable(${BTHREAD_UT_WE} ${BTHREAD_UT})
+    target_link_libraries(${BTHREAD_UT_WE} PRIVATE
+        gtest_main
+        brpc-shared-debug
+        ${GPERFTOOLS_LIBRARIES})
+    add_test(NAME ${BTHREAD_UT_WE} COMMAND ${BTHREAD_UT_WE})
+endforeach()
+
+# FlatBuffers tests use the release library, independently of the debug suite.
+if(WITH_FLATBUFFERS)
+    find_program(FLATBUFFERS_FLATC_EXECUTABLE NAMES flatc)
+    if(NOT FLATBUFFERS_FLATC_EXECUTABLE)
+        message(FATAL_ERROR
+            "FlatBuffers tests require an installed flatc; set FLATBUFFERS_FLATC_EXECUTABLE.")
+    endif()
+    set(FLATBUFFERS_TEST_HEADER
+        "${CMAKE_CURRENT_BINARY_DIR}/flatbuffers_message_generated.h")
+    add_custom_command(
+        OUTPUT "${FLATBUFFERS_TEST_HEADER}"
+        COMMAND "${FLATBUFFERS_FLATC_EXECUTABLE}" --cpp
+                -o "${CMAKE_CURRENT_BINARY_DIR}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/flatbuffers_message.fbs"
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/flatbuffers_message.fbs"
+                "${FLATBUFFERS_FLATC_EXECUTABLE}"
+        COMMENT "Generating FlatBuffers test messages"
+        VERBATIM)
+    foreach(FB_TEST brpc_flatbuffers_unittest brpc_flatbuffers_protocol_unittest)
+        add_executable(${FB_TEST} ${FB_TEST}.cpp "${FLATBUFFERS_TEST_HEADER}")
+        target_include_directories(${FB_TEST} BEFORE PRIVATE
+            "${BRPC_GTEST_INCLUDE_DIR}")
+        target_link_libraries(${FB_TEST} PRIVATE
+            brpc-static brpc_test_config gtest_main ${DYNAMIC_LIB})
+        add_test(NAME ${FB_TEST} COMMAND ${FB_TEST})
+    endforeach()
+
+    # The same probe compiled with the OFF configuration must report the same
+    # layout; the ON validation runs both and compares their output.
+    set(WITH_FLATBUFFERS_VAL 0)
+    configure_file("${PROJECT_SOURCE_DIR}/src/butil/config.h.in"
+                   "${CMAKE_CURRENT_BINARY_DIR}/layout_off/butil/config.h" @ONLY)
+    set(WITH_FLATBUFFERS_VAL 1)
+    foreach(FB_LAYOUT on off)
+        add_executable(flatbuffers_layout_probe_${FB_LAYOUT} flatbuffers_layout_probe.cpp)
+        if(FB_LAYOUT STREQUAL "off")
+            target_include_directories(flatbuffers_layout_probe_${FB_LAYOUT} BEFORE PRIVATE
+                "${CMAKE_CURRENT_BINARY_DIR}/layout_off")
+        endif()
+        target_compile_options(flatbuffers_layout_probe_${FB_LAYOUT} PRIVATE
+            -Wno-invalid-offsetof)
+        target_link_libraries(flatbuffers_layout_probe_${FB_LAYOUT} PRIVATE
+            brpc-static brpc_test_config ${DYNAMIC_LIB})
+    endforeach()
+endif()
+
+# brpc tests
+file(GLOB BRPC_UNITTESTS "brpc_*_unittest.cpp")
+list(REMOVE_ITEM BRPC_UNITTESTS
+    "${CMAKE_CURRENT_SOURCE_DIR}/brpc_flatbuffers_unittest.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/brpc_flatbuffers_protocol_unittest.cpp")
+foreach(BRPC_UT ${BRPC_UNITTESTS})
+    get_filename_component(BRPC_UT_WE ${BRPC_UT} NAME_WE)
+    add_executable(${BRPC_UT_WE} ${BRPC_UT} $<TARGET_OBJECTS:TEST_PROTO_LIB>)
+    target_link_libraries(${BRPC_UT_WE} PRIVATE
+        brpc-shared-debug
+        gtest_main
+        brpc_test_config
+        ${GPERFTOOLS_LIBRARIES})
+    add_test(NAME ${BRPC_UT_WE} COMMAND ${BRPC_UT_WE})
+endforeach()
+
+if(BUILD_FUZZ_TESTS)
+    add_library(brpc-static-debug STATIC $<TARGET_OBJECTS:BUTIL_DEBUG_LIB>
+                                        $<TARGET_OBJECTS:SOURCES_DEBUG_LIB>
+                                        $<TARGET_OBJECTS:PROTO_LIB>)
+    # change the debug lib output dir to be different from the release output
+    set_target_properties(brpc-static-debug PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/test)
+
+    target_link_libraries(brpc-static-debug PUBLIC brpc_test_config ${DYNAMIC_LIB})
+
+    set(FUZZ_TARGETS fuzz_butil fuzz_esp fuzz_hpack fuzz_http
+        fuzz_hulu fuzz_json fuzz_redis fuzz_shead fuzz_sofa fuzz_uri
+        fuzz_baidu_rpc fuzz_mongo fuzz_memcache
+        fuzz_couchbase fuzz_streaming fuzz_http_parser fuzz_amf
+        fuzz_rtmp)
+
+
+    foreach(target ${FUZZ_TARGETS})
+        add_executable(${target} fuzzing/${target}.cpp $<TARGET_OBJECTS:TEST_PROTO_LIB>)
+        target_link_libraries(${target} PRIVATE brpc-static-debug ${LIB_FUZZING_ENGINE})
+        set_target_properties(${target} PROPERTIES
+            BUILD_WITH_INSTALL_RPATH TRUE
+            INSTALL_RPATH "$ORIGIN/lib")
+    endforeach()
+endif()

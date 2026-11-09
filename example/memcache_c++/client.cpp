@@ -1,16 +1,19 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 // A multi-threaded client getting keys from a memcache server constantly.
 
@@ -20,11 +23,15 @@
 #include <butil/string_printf.h>
 #include <brpc/channel.h>
 #include <brpc/memcache.h>
+#include <brpc/policy/couchbase_authenticator.h>
 
 DEFINE_int32(thread_num, 10, "Number of threads to send requests");
 DEFINE_bool(use_bthread, false, "Use bthread to send requests");
+DEFINE_bool(use_couchbase, false, "Use couchbase.");
 DEFINE_string(connection_type, "", "Connection type. Available values: single, pooled, short");
 DEFINE_string(server, "0.0.0.0:11211", "IP Address of server");
+DEFINE_string(bucket_name, "", "Couchbase bucktet name");
+DEFINE_string(bucket_password, "", "Couchbase bucket password");
 DEFINE_string(load_balancer, "", "The algorithm for load balancing");
 DEFINE_int32(timeout_ms, 100, "RPC timeout in milliseconds");
 DEFINE_int32(max_retry, 3, "Max retries(not including the first RPC)"); 
@@ -36,7 +43,7 @@ DEFINE_int32(batch, 1, "Pipelined Operations");
 
 bvar::LatencyRecorder g_latency_recorder("client");
 bvar::Adder<int> g_error_count("client_error_count");
-butil::static_atomic<int> g_sender_count = BASE_STATIC_ATOMIC_INIT(0);
+butil::static_atomic<int> g_sender_count = BUTIL_STATIC_ATOMIC_INIT(0);
 
 static void* sender(void* arg) {
     google::protobuf::RpcChannel* channel = 
@@ -60,18 +67,18 @@ static void* sender(void* arg) {
         brpc::MemcacheResponse response;
         brpc::Controller cntl;
 
-        // Because `done'(last parameter) is NULL, this function waits until
+        // Because `done'(last parameter) is nullptr, this function waits until
         // the response comes back or error occurs(including timedout).
-        channel->CallMethod(NULL, &cntl, &request, &response, NULL);
+        channel->CallMethod(nullptr, &cntl, &request, &response, nullptr);
         const int64_t elp = cntl.latency_us();
         if (!cntl.Failed()) {
             g_latency_recorder << cntl.latency_us();
             for (int i = 0; i < FLAGS_batch; ++i) {
                 uint32_t flags;
-                if (!response.PopGet(&value, &flags, NULL)) {
+                if (!response.PopGet(&value, &flags, nullptr)) {
                     LOG(INFO) << "Fail to GET the key, " << response.LastError();
                     brpc::AskToQuit();
-                    return NULL;
+                    return nullptr;
                 }
                 CHECK(flags == 0xdeadbeef + base_index + i)
                     << "flags=" << flags;
@@ -89,12 +96,12 @@ static void* sender(void* arg) {
             bthread_usleep(50000);
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 int main(int argc, char* argv[]) {
     // Parse gflags. We recommend you to use gflags as well.
-    GFLAGS_NS::ParseCommandLineFlags(&argc, &argv, true);
+    GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     if (FLAGS_exptime < 0) {
         FLAGS_exptime = 0;
     }
@@ -103,12 +110,19 @@ int main(int argc, char* argv[]) {
     // Channel is thread-safe and can be shared by all threads in your program.
     brpc::Channel channel;
     
-    // Initialize the channel, NULL means using default options. 
+    // Initialize the channel, nullptr means using default options. 
     brpc::ChannelOptions options;
     options.protocol = brpc::PROTOCOL_MEMCACHE;
     options.connection_type = FLAGS_connection_type;
     options.timeout_ms = FLAGS_timeout_ms/*milliseconds*/;
     options.max_retry = FLAGS_max_retry;
+    if (FLAGS_use_couchbase && !FLAGS_bucket_name.empty()) {
+        brpc::policy::CouchbaseAuthenticator* auth =
+            new brpc::policy::CouchbaseAuthenticator(FLAGS_bucket_name,
+                                                     FLAGS_bucket_password);
+        options.auth = auth;
+    }
+
     if (channel.Init(FLAGS_server.c_str(), FLAGS_load_balancer.c_str(), &options) != 0) {
         LOG(ERROR) << "Fail to initialize channel";
         return -1;
@@ -127,13 +141,13 @@ int main(int argc, char* argv[]) {
             return -1;
         }
     }
-    channel.CallMethod(NULL, &cntl, &request, &response, NULL);
+    channel.CallMethod(nullptr, &cntl, &request, &response, nullptr);
     if (cntl.Failed()) {
         LOG(ERROR) << "Fail to access memcache, " << cntl.ErrorText();
         return -1;
     }
     for (int i = 0; i < FLAGS_batch * FLAGS_thread_num; ++i) {
-        if (!response.PopSet(NULL)) {
+        if (!response.PopSet(nullptr)) {
             LOG(ERROR) << "Fail to SET memcache, i=" << i
                        << ", " << response.LastError();
             return -1;
@@ -147,19 +161,21 @@ int main(int argc, char* argv[]) {
                   << " values, never expired";
     }
     
-    std::vector<bthread_t> tids;
-    tids.resize(FLAGS_thread_num);
+    std::vector<bthread_t> bids;
+    std::vector<pthread_t> pids;
     if (!FLAGS_use_bthread) {
+        pids.resize(FLAGS_thread_num);
         for (int i = 0; i < FLAGS_thread_num; ++i) {
-            if (pthread_create(&tids[i], NULL, sender, &channel) != 0) {
+            if (pthread_create(&pids[i], nullptr, sender, &channel) != 0) {
                 LOG(ERROR) << "Fail to create pthread";
                 return -1;
             }
         }
     } else {
+        bids.resize(FLAGS_thread_num);
         for (int i = 0; i < FLAGS_thread_num; ++i) {
             if (bthread_start_background(
-                    &tids[i], NULL, sender, &channel) != 0) {
+                    &bids[i], nullptr, sender, &channel) != 0) {
                 LOG(ERROR) << "Fail to create bthread";
                 return -1;
             }
@@ -175,10 +191,13 @@ int main(int argc, char* argv[]) {
     LOG(INFO) << "memcache_client is going to quit";
     for (int i = 0; i < FLAGS_thread_num; ++i) {
         if (!FLAGS_use_bthread) {
-            pthread_join(tids[i], NULL);
+            pthread_join(pids[i], nullptr);
         } else {
-            bthread_join(tids[i], NULL);
+            bthread_join(bids[i], nullptr);
         }
+    }
+    if (options.auth) {
+        delete options.auth;
     }
 
     return 0;

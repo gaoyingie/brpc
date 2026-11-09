@@ -1,24 +1,29 @@
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Authors: Ge,Jun (gejun@baidu.com)
 
 #include <google/protobuf/descriptor.h>          // MethodDescriptor
 #include <google/protobuf/message.h>             // Message
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include <google/protobuf/io/coded_stream.h>
+
 #include "butil/time.h"
+#include "butil/strings/string_util.h"
+
 #include "brpc/controller.h"                // Controller
 #include "brpc/socket.h"                    // Socket
 #include "brpc/server.h"                    // Server
@@ -33,7 +38,7 @@
 #include "brpc/details/usercode_backup_pool.h"
 
 extern "C" {
-void bthread_assign_data(void* data) __THROW;
+void bthread_assign_data(void* data);
 }
 
 
@@ -127,9 +132,8 @@ private:
     const char* _stream;
 };
 
-inline void PackSofaHeader(char* sofa_header, int meta_size, int body_size) {
-    // dummy supresses strict-aliasing warning.
-    uint32_t* dummy = reinterpret_cast<uint32_t*>(sofa_header);
+inline void PackSofaHeader(char* sofa_header, uint32_t meta_size, int body_size) {
+    uint32_t* dummy = reinterpret_cast<uint32_t*>(sofa_header); // suppress strict-alias warning
     *dummy = *reinterpret_cast<const uint32_t*>("SOFA");
 
     SofaRawPacker rp(sofa_header + 4);
@@ -138,7 +142,7 @@ inline void PackSofaHeader(char* sofa_header, int meta_size, int body_size) {
 
 static void SerializeSofaHeaderAndMeta(
     butil::IOBuf* out, const SofaRpcMeta& meta, int payload_size) {
-    const int meta_size = meta.ByteSize();
+    const uint32_t meta_size = GetProtobufByteSize(meta);
     if (meta_size <= 232) { // most common cases
         char header_and_meta[24 + meta_size];
         PackSofaHeader(header_and_meta, meta_size, payload_size);
@@ -185,11 +189,12 @@ ParseResult ParseSofaMessage(butil::IOBuf* source, Socket* socket,
                    << " + body_size=" << body_size;
         return MakeParseError(PARSE_ERROR_TRY_OTHERS);
     }
-    if (body_size > FLAGS_max_body_size) {
-        // We need this log to report the body_size to give users some clues
+    if (body_size > FLAGS_max_body_size ||
+        meta_size > FLAGS_max_body_size) {
+        // We need this log to report the size to give users some clues
         // which is not printed in InputMessenger.
-        LOG(ERROR) << "body_size=" << body_size << " from "
-                   << socket->remote_side() << " is too large";
+        LOG(ERROR) << "body_size=" << body_size << " meta_size=" << meta_size
+                   << " from " << socket->remote_side() << " is too large";
         return MakeParseError(PARSE_ERROR_TOO_BIG_DATA);
     } else if (source->length() < sizeof(header_buf) + msg_size) {
         return MakeParseError(PARSE_ERROR_NOT_ENOUGH_DATA);
@@ -207,21 +212,19 @@ static void SendSofaResponse(int64_t correlation_id,
                              Controller* cntl, 
                              const google::protobuf::Message* req,
                              const google::protobuf::Message* res,
-                             Socket* socket_raw,
                              const Server* server,
-                             MethodStatus* method_status_raw,
-                             long start_parse_us) {
+                             MethodStatus* method_status,
+                             int64_t received_us) {
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
+    auto span = accessor.span();
     if (span) {
         span->set_start_send_us(butil::cpuwide_time_us());
     }
-    ScopedMethodStatus method_status(method_status_raw);
-    SocketUniquePtr sock(socket_raw);
+    Socket* sock = accessor.get_sending_socket();
     std::unique_ptr<Controller, LogErrorTextAndDelete> recycle_cntl(cntl);
+    ConcurrencyRemover concurrency_remover(method_status, cntl, received_us);
     std::unique_ptr<const google::protobuf::Message> recycle_req(req);
     std::unique_ptr<const google::protobuf::Message> recycle_res(res);
-    ScopedRemoveConcurrency remove_concurrency_dummy(server, cntl);
 
     if (cntl->IsCloseConnection()) {
         sock->SetFailed();
@@ -234,11 +237,11 @@ static void SendSofaResponse(int64_t correlation_id,
 
     bool append_body = false;
     butil::IOBuf res_body;
-    // `res' can be NULL here, in which case we don't serialize it
+    // `res' can be nullptr here, in which case we don't serialize it
     // If user calls `SetFailed' on Controller, we don't serialize
     // response either
     CompressType type = cntl->response_compress_type();
-    if (res != NULL && !cntl->Failed()) {
+    if (res != nullptr && !cntl->Failed()) {
         if (!res->IsInitialized()) {
             cntl->SetFailed(
                 ERESPONSE, "Missing required fields in response: %s", 
@@ -282,8 +285,15 @@ static void SendSofaResponse(int64_t correlation_id,
     }
     // Have the risk of unlimited pending responses, in which case, tell
     // users to set max_concurrency.
+    ResponseWriteInfo args;
     Socket::WriteOptions wopt;
     wopt.ignore_eovercrowded = true;
+    bthread_id_t response_id = INVALID_BTHREAD_ID;
+    if (span) {
+        CHECK_EQ(0, bthread_id_create(&response_id, &args, HandleResponseWritten));
+        wopt.id_wait = response_id;
+        wopt.notify_on_success = true;
+    }
     if (sock->Write(&res_buf, &wopt) != 0) {
         const int errcode = errno;
         PLOG_IF(WARNING, errcode != EPIPE) << "Fail to write into " << *sock;
@@ -291,13 +301,12 @@ static void SendSofaResponse(int64_t correlation_id,
                         sock->description().c_str());
         return;
     }
+
     if (span) {
+        bthread_id_join(response_id);
+        // Do not care about the result of background writing.
         // TODO: this is not sent
-        span->set_sent_us(butil::cpuwide_time_us());
-    }
-    if (method_status) {
-        method_status.release()->OnResponded(
-            !cntl->Failed(), butil::cpuwide_time_us() - start_parse_us);
+        span->set_sent_us(args.sent_us);
     }
 }
 
@@ -313,7 +322,8 @@ void EndRunningCallMethodInPool(
 void ProcessSofaRequest(InputMessageBase* msg_base) {
     const int64_t start_parse_us = butil::cpuwide_time_us();
     DestroyingPtr<MostCommonMessage> msg(static_cast<MostCommonMessage*>(msg_base));
-    SocketUniquePtr socket(msg->ReleaseSocket());
+    SocketUniquePtr socket_guard(msg->ReleaseSocket());
+    Socket* socket = socket_guard.get();
     const Server* server = static_cast<const Server*>(msg_base->arg());
     ScopedNonServiceError non_service_error(server);
 
@@ -328,18 +338,14 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
 
     SampledRequest* sample = AskToBeSampled();
     if (sample) {
-        sample->set_method_name(meta.method());
-        sample->set_compress_type(req_cmp_type);
-        sample->set_protocol_type(PROTOCOL_SOFA_PBRPC);
+        sample->meta.set_method_name(meta.method());
+        sample->meta.set_compress_type(req_cmp_type);
+        sample->meta.set_protocol_type(PROTOCOL_SOFA_PBRPC);
         sample->request = msg->payload;
         sample->submit(start_parse_us);
     }
 
-    std::unique_ptr<Controller> cntl(new (std::nothrow) Controller);
-    if (NULL == cntl.get()) {
-        LOG(WARNING) << "Fail to new Controller";
-        return;
-    }
+    std::unique_ptr<Controller> cntl(new Controller);
     std::unique_ptr<google::protobuf::Message> req;
     std::unique_ptr<google::protobuf::Message> res;
 
@@ -356,26 +362,29 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         .set_remote_side(socket->remote_side())
         .set_local_side(socket->local_side())
         .set_auth_context(socket->auth_context())
-        .set_request_protocol(PROTOCOL_SOFA_PBRPC);
+        .set_request_protocol(PROTOCOL_SOFA_PBRPC)
+        .set_begin_time_us(msg->received_us())
+        .move_in_server_receiving_sock(socket_guard);
 
     // Tag the bthread with this server's key for thread_local_data().
     if (server->thread_local_options().thread_local_data_factory) {
         bthread_assign_data((void*)&server->thread_local_options());
     }
 
-    Span* span = NULL;
+    std::shared_ptr<Span> span;
     if (IsTraceable(false)) {
         span = Span::CreateServerSpan(
             0/*meta.trace_id()*/, 0/*meta.span_id()*/,
             0/*meta.parent_span_id()*/, msg->base_real_us());
         accessor.set_span(span);
-        span->set_remote_side(socket->remote_side());
+        span->set_remote_side(cntl->remote_side());
         span->set_protocol(PROTOCOL_SOFA_PBRPC);
         span->set_received_us(msg->received_us());
         span->set_start_parse_us(start_parse_us);
         span->set_request_size(msg->meta.size() + msg->payload.size() + 24);
     }
-    MethodStatus* method_status = NULL;
+
+    MethodStatus* method_status = nullptr;
     do {
         if (!server->IsRunning()) {
             cntl->SetFailed(ELOGOFF, "Server is stopping");
@@ -383,8 +392,9 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
         }
 
         if (!server_accessor.AddConcurrency(cntl.get())) {
-            cntl->SetFailed(ELIMIT, "Reached server's max_concurrency=%d",
-                            server->options().max_concurrency);
+            cntl->SetFailed(
+                ELIMIT, "Reached server's max_concurrency=%d",
+                server->options().max_concurrency);
             break;
         }
         if (FLAGS_usercode_in_pthread && TooManyUserCode()) {
@@ -393,29 +403,45 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
             break;
         }
         
-        const Server::MethodProperty *sp =
+        const Server::MethodProperty* mp =
             server_accessor.FindMethodPropertyByFullName(meta.method());
-        if (NULL == sp) {
+        if (nullptr == mp) {
             cntl->SetFailed(ENOMETHOD, "Fail to find method=%s", 
                             meta.method().c_str());
             break;
         }
+        if (RejectBuiltinAccess(cntl.get(), *server, mp) ||
+            RejectNonBuiltinAccessFromInternalPort(cntl.get(), *server, mp)) {
+            break;
+        }
+        if (socket->is_overcrowded() &&
+            !server->options().ignore_eovercrowded &&
+            !mp->ignore_eovercrowded) {
+            cntl->SetFailed(EOVERCROWDED, "Connection to %s is overcrowded",
+                            butil::endpoint2str(socket->remote_side()).c_str());
+            break;
+        }
         // Switch to service-specific error.
         non_service_error.release();
-        method_status = sp->status;
+        method_status = mp->status;
         if (method_status) {
-            if (!method_status->OnRequested()) {
-                cntl->SetFailed(ELIMIT, "Reached %s's max_concurrency=%d",
-                                sp->method->full_name().c_str(),
-                                method_status->max_concurrency());
+            int rejected_cc = 0;
+            if (!method_status->OnRequested(&rejected_cc)) {
+                cntl->SetFailed(ELIMIT, "Rejected by %s's ConcurrencyLimiter, concurrency=%d",
+                                butil::EnsureString(mp->method->full_name()).c_str(), rejected_cc);
                 break;
             }
         }
-        google::protobuf::Service* svc = sp->service;
-        const google::protobuf::MethodDescriptor* method = sp->method;
+        google::protobuf::Service* svc = mp->service;
+        const google::protobuf::MethodDescriptor* method = mp->method;
         accessor.set_method(method);
+
+        if (!server->AcceptRequest(cntl.get())) {
+            break;
+        }
+
         if (span) {
-            span->ResetServerSpanName(method->full_name());
+            span->ResetServerSpanName(butil::EnsureString(method->full_name()));
         }
         req.reset(svc->GetRequestPrototype(method).New());
         if (!ParseFromCompressedData(msg->payload, req.get(), req_cmp_type)) {
@@ -424,17 +450,19 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
                             req_cmp_type, (int)msg->payload.size());
             break;
         }
-        msg.reset();  // optional, just release resourse ASAP
 
         res.reset(svc->GetResponsePrototype(method).New());
         // `socket' will be held until response has been sent
         google::protobuf::Closure* done = ::brpc::NewCallback<
             int64_t, Controller*, const google::protobuf::Message*,
-            const google::protobuf::Message*, Socket*, const Server*,
-                  MethodStatus *, long>(
+            const google::protobuf::Message*, const Server*,
+                  MethodStatus *, int64_t>(
                     &SendSofaResponse, correlation_id, cntl.get(),
-                    req.get(), res.get(), socket.release(), server,
-                    method_status, start_parse_us);
+                    req.get(), res.get(), server,
+                    method_status, msg->received_us());
+
+        msg.reset();  // optional, just release resource ASAP
+
         // `cntl', `req' and `res' will be deleted inside `done'
         if (span) {
             span->set_start_callback_us(butil::cpuwide_time_us());
@@ -458,8 +486,8 @@ void ProcessSofaRequest(InputMessageBase* msg_base) {
     // `cntl', `req' and `res' will be deleted inside `SendSofaResponse'
     // `socket' will be held until response has been sent
     SendSofaResponse(correlation_id, cntl.release(),
-                     req.release(), res.release(), socket.release(), server,
-                     method_status, -1);
+                     req.release(), res.release(), server,
+                     method_status, msg->received_us());
 }
 
 bool VerifySofaRequest(const InputMessageBase* msg_base) {
@@ -481,17 +509,25 @@ void ProcessSofaResponse(InputMessageBase* msg_base) {
     }
 
     const bthread_id_t cid = { static_cast<uint64_t>(meta.sequence_id()) };
-    Controller* cntl = NULL;
+    Controller* cntl = nullptr;
     const int rc = bthread_id_lock(cid, (void**)&cntl);
     if (rc != 0) {
         LOG_IF(ERROR, rc != EINVAL && rc != EPERM)
             << "Fail to lock correlation_id=" << cid << ": " << berror(rc);
         return;
     }
-    
+
+    if (cntl == nullptr || !ControllerPrivateAccessor(cntl)
+            .does_response_match_request_socket(cid, msg->socket()->id())) {
+        LOG(WARNING) << "correlation_id=" << cid.value
+                     << " of the response from " << *msg->socket()
+                     << " does not match a request sent over it, drop it";
+        CHECK_EQ(0, bthread_id_unlock(cid));
+        return;
+    }
+
     ControllerPrivateAccessor accessor(cntl);
-    Span* span = accessor.span();
-    if (span) {
+    if (auto span = accessor.span()) {
         span->set_base_real_us(msg->base_real_us());
         span->set_received_us(msg->received_us());
         span->set_response_size(msg->meta.size() + msg->payload.size() + 24);
@@ -510,7 +546,7 @@ void ProcessSofaResponse(InputMessageBase* msg_base) {
             cntl->SetFailed(
                 ERESPONSE, "Fail to parse response message, "
                 "CompressType=%d, response_size=%" PRIu64, 
-                res_cmp_type, msg->payload.length());
+                res_cmp_type, (uint64_t)msg->payload.length());
         } else {
             cntl->set_response_compress_type(res_cmp_type);
         }
@@ -518,7 +554,7 @@ void ProcessSofaResponse(InputMessageBase* msg_base) {
 
     // Unlocks correlation_id inside. Revert controller's
     // error code if it version check of `cid' fails
-    msg.reset();  // optional, just release resourse ASAP
+    msg.reset();  // optional, just release resource ASAP
     accessor.OnResponse(cid, saved_error);
 }
 
@@ -539,11 +575,11 @@ void PackSofaRequest(butil::IOBuf* req_buf,
     if (method) {
         meta.set_method(method->full_name());
         meta.set_compress_type(CompressType2Sofa(cntl->request_compress_type()));
-    } else if (cntl->rpc_dump_meta()) {
+    } else if (cntl->sampled_request()) {
         // Replaying.
-        meta.set_method(cntl->rpc_dump_meta()->method_name());
+        meta.set_method(cntl->sampled_request()->meta.method_name());
         meta.set_compress_type(
-            CompressType2Sofa(cntl->rpc_dump_meta()->compress_type()));
+            CompressType2Sofa(cntl->sampled_request()->meta.compress_type()));
     } else {
         return cntl->SetFailed(ENOMETHOD, "method is NULL");
     }

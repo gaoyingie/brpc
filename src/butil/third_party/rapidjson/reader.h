@@ -115,7 +115,7 @@ RAPIDJSON_DIAG_OFF(effc++)
 
 #include "error/error.h" // ParseErrorCode, ParseResult
 
-RAPIDJSON_NAMESPACE_BEGIN
+BUTIL_RAPIDJSON_NAMESPACE_BEGIN
 
 template<class T, class U> 
 struct is_same {
@@ -430,6 +430,11 @@ public:
                     RAPIDJSON_PARSE_ERROR_NORETURN(kParseErrorDocumentRootNotSingular, is.Tell());
                     RAPIDJSON_PARSE_ERROR_EARLY_RETURN(parseResult_);
                 }
+            } else {
+                // jge: Update parseResult_.Offset() when kParseStopwhendoneflag
+                // is set which means the user needs to know where to resume
+                // parsing in next calls to JsonToProtoMessage()
+                SetParseError(kParseErrorNone, is.Tell());
             }
         }
 
@@ -1531,9 +1536,14 @@ private:
             state = d;
 
             // Do not further consume streams if a root JSON has been parsed.
-            if ((parseFlags & kParseStopWhenDoneFlag) && state == IterativeParsingFinishState)
+            if ((parseFlags & kParseStopWhenDoneFlag) && state == IterativeParsingFinishState) {
+                // wwb: Update parseResult_.Offset() when kParseStopWhenDoneFlag
+                // is set which means the user needs to know where to resume
+                // parsing in next calls to JsonToProtoMessage(), including
+                // when the root ends exactly at EOF.
+                SetParseError(kParseErrorNone, is.Tell());
                 break;
-
+            }
             SkipWhitespace(is);
         }
 
@@ -1552,7 +1562,7 @@ private:
 //! Reader with UTF8 encoding and default allocator.
 typedef GenericReader<UTF8<>, UTF8<> > Reader;
 
-RAPIDJSON_NAMESPACE_END
+BUTIL_RAPIDJSON_NAMESPACE_END
 
 #ifdef __GNUC__
 RAPIDJSON_DIAG_POP

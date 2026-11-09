@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_CONTAINERS_SCOPED_PTR_HASH_MAP_H_
-#define BASE_CONTAINERS_SCOPED_PTR_HASH_MAP_H_
+#ifndef BUTIL_CONTAINERS_SCOPED_PTR_HASH_MAP_H_
+#define BUTIL_CONTAINERS_SCOPED_PTR_HASH_MAP_H_
 
 #include <algorithm>
 #include <utility>
@@ -78,8 +78,8 @@ class ScopedPtrHashMap {
       return scoped_ptr<Value>();
 
     scoped_ptr<Value> ret(it->second);
-    it->second = NULL;
-    return ret.Pass();
+    it->second = nullptr;
+    return ret;
   }
 
   scoped_ptr<Value> take(const Key& k) {
@@ -97,7 +97,7 @@ class ScopedPtrHashMap {
 
     scoped_ptr<Value> ret(it->second);
     data_.erase(it);
-    return ret.Pass();
+    return ret;
   }
 
   scoped_ptr<Value> take_and_erase(const Key& k) {
@@ -109,11 +109,11 @@ class ScopedPtrHashMap {
   }
 
   // Returns the element in the hash_map that matches the given key.
-  // If no such element exists it returns NULL.
+  // If no such element exists it returns nullptr.
   Value* get(const Key& k) const {
     const_iterator it = find(k);
     if (it == end())
-      return NULL;
+      return nullptr;
     return it->second;
   }
 
@@ -154,4 +154,4 @@ class ScopedPtrHashMap {
 
 }  // namespace butil
 
-#endif  // BASE_CONTAINERS_SCOPED_PTR_HASH_MAP_H_
+#endif  // BUTIL_CONTAINERS_SCOPED_PTR_HASH_MAP_H_

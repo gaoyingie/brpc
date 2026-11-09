@@ -2,8 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_DEBUG_STACK_TRACE_H_
-#define BASE_DEBUG_STACK_TRACE_H_
+#ifndef BUTIL_DEBUG_STACK_TRACE_H_
+#define BUTIL_DEBUG_STACK_TRACE_H_
 
 #include <iosfwd>
 #include <string>
@@ -25,7 +25,7 @@ namespace debug {
 // Enables stack dump to console output on exception and signals.
 // When enabled, the process will quit immediately. This is meant to be used in
 // unit_tests only! This is not thread-safe: only call from main thread.
-BASE_EXPORT bool EnableInProcessStackDumping();
+BUTIL_EXPORT bool EnableInProcessStackDumping();
 
 // A different version of EnableInProcessStackDumping that also works for
 // sandboxed processes.  For more details take a look at the description
@@ -34,15 +34,16 @@ BASE_EXPORT bool EnableInProcessStackDumping();
 // contents. In DEBUG builds, this function also opens the object files that
 // are loaded in memory and caches their file descriptors (this cannot be
 // done in official builds because it has security implications).
-BASE_EXPORT bool EnableInProcessStackDumpingForSandbox();
+BUTIL_EXPORT bool EnableInProcessStackDumpingForSandbox();
 
 // A stacktrace can be helpful in debugging. For example, you can include a
 // stacktrace member in a object (probably around #ifndef NDEBUG) so that you
 // can later see where the given object was created from.
-class BASE_EXPORT StackTrace {
+class BUTIL_EXPORT StackTrace {
  public:
   // Creates a stacktrace from the current location.
-  StackTrace();
+  // Exclude constructor frame of StackTrace if |exclude_self| is true.
+  explicit StackTrace(bool exclude_self = false);
 
   // Creates a stacktrace from an existing array of instruction
   // pointers (such as returned by Addresses()).  |count| will be
@@ -58,11 +59,19 @@ class BASE_EXPORT StackTrace {
 
   // Copying and assignment are allowed with the default functions.
 
-  ~StackTrace();
-
   // Gets an array of instruction pointer values. |*count| will be set to the
   // number of elements in the returned array.
   const void* const* Addresses(size_t* count) const;
+
+  // Gets the number of frames in the stack trace.
+  size_t FrameCount() const { return count_; }
+
+  // Copies the stack trace to |buffer|,
+  // where the size is min(max_nframes, frame_count()).
+  size_t CopyAddressTo(void** dest, size_t max_nframes) const;
+
+  // Whether if the given symbol is found in the stack trace.
+  bool FindSymbol(void* symbol) const;
 
   // Prints the stack trace to stderr.
   void Print() const;
@@ -70,6 +79,7 @@ class BASE_EXPORT StackTrace {
 #if !defined(__UCLIBC__)
   // Resolves backtrace to symbols and write to stream.
   void OutputToStream(std::ostream* os) const;
+  void OutputToString(std::string& str) const;
 #endif
 
   // Resolves backtrace to symbols and returns as string.
@@ -82,7 +92,7 @@ class BASE_EXPORT StackTrace {
   // doesn't give much more information.
   static const int kMaxTraces = 62;
 
-  void* trace_[kMaxTraces];
+  void* trace_[kMaxTraces]{};
 
   // The number of valid frames in |trace_|.
   size_t count_;
@@ -94,10 +104,10 @@ namespace internal {
 // POSIX doesn't define any async-signal safe function for converting
 // an integer to ASCII. We'll have to define our own version.
 // itoa_r() converts a (signed) integer to ASCII. It returns "buf", if the
-// conversion was successful or NULL otherwise. It never writes more than "sz"
+// conversion was successful or nullptr otherwise. It never writes more than "sz"
 // bytes. Output will be truncated as needed, and a NUL character is always
 // appended.
-BASE_EXPORT char *itoa_r(intptr_t i,
+BUTIL_EXPORT char *itoa_r(intptr_t i,
                          char *buf,
                          size_t sz,
                          int base,
@@ -109,4 +119,4 @@ BASE_EXPORT char *itoa_r(intptr_t i,
 }  // namespace debug
 }  // namespace butil
 
-#endif  // BASE_DEBUG_STACK_TRACE_H_
+#endif  // BUTIL_DEBUG_STACK_TRACE_H_

@@ -1,14 +1,130 @@
-// Baidu RPC - A framework to host and access services throughout Baidu.
-// Copyright (c) 2014 Baidu, Inc.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+// brpc - A framework to host and access services throughout Baidu.
 
 // Date: 2017/04/25 00:23:12
 
 #include <gtest/gtest.h>
+#include <pthread.h>
 #include "brpc/details/hpack.h"
 #include "butil/logging.h"
 
 class HPackTest : public testing::Test {
 };
+
+static void* DecodeManyDynamicTableSizeUpdates(void*) {
+    brpc::HPacker p;
+    if (p.Init(4096) != 0) {
+        return (void*)1;
+    }
+
+    butil::IOBuf buf;
+    std::string updates(200000, '\x20');
+    buf.append(updates);
+
+    brpc::HPacker::Header h;
+    return (void*)(p.Decode(&buf, &h) != 0);
+}
+
+TEST_F(HPackTest, many_dynamic_table_size_updates) {
+    // Decode many consecutive Dynamic Table Size Update entries on a low-stack
+    // thread so that excessive stack usage (e.g. recursion over the updates)
+    // would be caught. Avoid fork(): brpc spawns background threads (such as
+    // bvar_sampler), so a fork() in this multithreaded process inherits
+    // mutexes locked by the forked-away thread, which are never released in
+    // the child and deadlock it (the parent then blocks in waitpid forever).
+    pthread_attr_t attr;
+    ASSERT_EQ(0, pthread_attr_init(&attr));
+    ASSERT_EQ(0, pthread_attr_setstacksize(&attr, 64 * 1024));
+    pthread_t tid;
+    ASSERT_EQ(0, pthread_create(&tid, &attr, DecodeManyDynamicTableSizeUpdates, nullptr));
+    pthread_attr_destroy(&attr);
+    void* ret = nullptr;
+    ASSERT_EQ(0, pthread_join(tid, &ret));
+    ASSERT_EQ(nullptr, ret);
+}
+
+TEST_F(HPackTest, dynamic_table_size_update_before_header) {
+    brpc::HPacker p;
+    ASSERT_EQ(0, p.Init(4096));
+
+    butil::IOBuf buf;
+    uint8_t encoded[] = {
+        0x20,  // Dynamic table size update to 0.
+        0x82,  // Indexed :method: GET.
+    };
+    buf.append(encoded, sizeof(encoded));
+
+    brpc::HPacker::Header h;
+    ASSERT_EQ((ssize_t)sizeof(encoded), p.Decode(&buf, &h));
+    ASSERT_TRUE(buf.empty());
+    ASSERT_EQ(":method", h.name);
+    ASSERT_EQ("GET", h.value);
+}
+
+TEST_F(HPackTest, dynamic_table_size_update_over_advertised_limit) {
+    // RFC 7541 section 4.2/6.3: a dynamic table size update must not exceed
+    // the max size this decoder advertised via SETTINGS_HEADER_TABLE_SIZE
+    // (i.e. what Init() was called with), not the protocol default of 4096.
+    // Previously the update was validated against the compile-time default,
+    // so a decoder initialized with a smaller table accepted a peer update
+    // that regrew the table beyond the queue it was sized for.
+    brpc::HPacker p;
+    ASSERT_EQ(0, p.Init(256));
+    {
+        // Update to 256 (== advertised limit) is acceptable.
+        butil::IOBuf buf;
+        uint8_t ok[] = { 0x3F, 0xE1, 0x01 };  // size update to 256
+        buf.append(ok, sizeof(ok));
+        brpc::HPacker::Header h;
+        ASSERT_GE(p.Decode(&buf, &h), 0);
+    }
+    {
+        // Update to 4096 (> advertised 256) must be rejected as malformed,
+        // even though it equals the protocol default.
+        butil::IOBuf buf;
+        uint8_t bad[] = { 0x3F, 0xE1, 0x1F };  // size update to 4096
+        buf.append(bad, sizeof(bad));
+        brpc::HPacker::Header h;
+        ASSERT_EQ(-1, p.Decode(&buf, &h));
+    }
+}
+
+TEST_F(HPackTest, integer_with_overlong_continuation) {
+    brpc::HPacker p;
+    ASSERT_EQ(0, p.Init(4096));
+
+    // Indexed header field whose index is encoded with a 7-bit prefix of all
+    // ones (0xFF) followed by a long run of 0x80 continuation octets. Each
+    // 0x80 carries a zero payload, so the decoded value never grows past its
+    // MAX_HPACK_INTEGER guard, but the per-octet shift amount does. Decode must
+    // reject this as malformed instead of shifting by 64+ bits.
+    butil::IOBuf buf;
+    uint8_t encoded[1 + 20];
+    encoded[0] = 0xFF;
+    for (size_t i = 1; i < sizeof(encoded); ++i) {
+        encoded[i] = 0x80;
+    }
+    buf.append(encoded, sizeof(encoded));
+
+    brpc::HPacker::Header h;
+    ASSERT_LT(p.Decode(&buf, &h), 0);
+}
 
 // Copied test cases from example of rfc7541
 TEST_F(HPackTest, header_with_indexing) {
@@ -17,14 +133,14 @@ TEST_F(HPackTest, header_with_indexing) {
     brpc::HPacker p2;
     ASSERT_EQ(0, p2.Init(4096));
     brpc::HPacker::Header h;
-    h.name = "custom-key";
+    h.name = "Custom-Key";
     h.value = "custom-header";
     brpc::HPackOptions options;
     options.index_policy = brpc::HPACK_INDEX_HEADER;
     butil::IOBufAppender buf;
-    ssize_t nwrite = p1.Encode(&buf, h, options);
-    ASSERT_EQ((size_t)nwrite, buf.buf().length());
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    p1.Encode(&buf, h, options);
+    const ssize_t nwrite = buf.buf().size();
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     uint8_t expected[] = {
         0x40, 0x0a, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x6b, 0x65, 0x79,
         0x0d, 0x63, 0x75, 0x73, 0x74, 0x6f, 0x6d, 0x2d, 0x68, 0x65, 0x61, 0x64,
@@ -35,7 +151,9 @@ TEST_F(HPackTest, header_with_indexing) {
     ssize_t nread = p2.Decode(&buf.buf(), &h2);
     ASSERT_EQ(nread, nwrite);
     ASSERT_TRUE(buf.buf().empty());
-    ASSERT_EQ(h.name, h2.name);
+    std::string lowercase_name = h.name;
+    brpc::tolower(&lowercase_name);
+    ASSERT_EQ(lowercase_name, h2.name);
     ASSERT_EQ(h.value, h2.value);
 }
 
@@ -50,9 +168,9 @@ TEST_F(HPackTest, header_without_indexing) {
     brpc::HPackOptions options;
     options.index_policy = brpc::HPACK_NOT_INDEX_HEADER;
     butil::IOBufAppender buf;
-    ssize_t nwrite = p1.Encode(&buf, h, options);
-    ASSERT_EQ((size_t)nwrite, buf.buf().length());
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    p1.Encode(&buf, h, options);
+    const ssize_t nwrite = buf.buf().size();
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     uint8_t expected[] = {
         0x04, 0x0c, 0x2f, 0x73, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2f, 0x70, 0x61,
         0x74, 0x68, 
@@ -63,7 +181,9 @@ TEST_F(HPackTest, header_without_indexing) {
     ssize_t nread = p2.Decode(&buf.buf(), &h2);
     ASSERT_EQ(nread, nwrite);
     ASSERT_TRUE(buf.buf().empty());
-    ASSERT_EQ(h.name, h2.name);
+    std::string lowercase_name = h.name;
+    brpc::tolower(&lowercase_name);
+    ASSERT_EQ(lowercase_name, h2.name);
     ASSERT_EQ(h.value, h2.value);
 }
 
@@ -78,11 +198,12 @@ TEST_F(HPackTest, header_never_indexed) {
     brpc::HPackOptions options;
     options.index_policy = brpc::HPACK_NEVER_INDEX_HEADER;
     butil::IOBufAppender buf;
-    ssize_t nwrite = p1.Encode(&buf, h, options);
-    ASSERT_EQ((size_t)nwrite, buf.buf().length());
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    p1.Encode(&buf, h, options);
+    const ssize_t nwrite = buf.buf().size();
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     uint8_t expected[] = {
-        0x10, 0x08, 0x70, 0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64, 0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, 
+        0x10, 0x08, 0x70, 0x61, 0x73, 0x73, 0x77, 0x6f, 0x72, 0x64,
+        0x06, 0x73, 0x65, 0x63, 0x72, 0x65, 0x74, 
     };
     butil::StringPiece sp((char*)expected, sizeof(expected));
     ASSERT_TRUE(buf.buf().equals(sp));
@@ -105,9 +226,9 @@ TEST_F(HPackTest, indexed_header) {
     brpc::HPackOptions options;
     options.index_policy = brpc::HPACK_INDEX_HEADER;
     butil::IOBufAppender buf;
-    ssize_t nwrite = p1.Encode(&buf, h, options);
-    ASSERT_EQ((size_t)nwrite, buf.buf().length());
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    p1.Encode(&buf, h, options);
+    const ssize_t nwrite = buf.buf().size();
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     uint8_t expected[] = {
         0x82,
     };
@@ -246,7 +367,7 @@ TEST_F(HPackTest, requests_with_huffman) {
         0x82, 0x86, 0x84, 0x41, 0x8c, 0xf1, 0xe3, 0xc2, 0xe5, 0xf2, 0x3a, 0x6b,
         0xa0, 0xab, 0x90, 0xf4, 0xff
     };
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     ASSERT_TRUE(buf.buf().equals(butil::StringPiece((char*)expected1, sizeof(expected1))));
     for (size_t i = 0; i < ARRAY_SIZE(header1); ++i) {
         brpc::HPacker::Header h;
@@ -347,7 +468,7 @@ TEST_F(HPackTest, responses_without_huffman) {
         0x74, 0x74, 0x70, 0x73, 0x3a, 0x2f, 0x2f, 0x77, 0x77, 0x77, 0x2e, 0x65,
         0x78, 0x61, 0x6d, 0x70, 0x6c, 0x65, 0x2e, 0x63, 0x6f, 0x6d, 
     };
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     ASSERT_TRUE(buf.buf().equals(butil::StringPiece((char*)expected1, sizeof(expected1))));
     for (size_t i = 0; i < ARRAY_SIZE(header1); ++i) {
         brpc::HPacker::Header h;
@@ -452,7 +573,7 @@ TEST_F(HPackTest, responses_with_huffman) {
         0x91, 0x9d, 0x29, 0xad, 0x17, 0x18, 0x63, 0xc7, 0x8f, 0x0b, 0x97, 0xc8, 
         0xe9, 0xae, 0x82, 0xae, 0x43, 0xd3,             
     };
-    LOG(INFO) << butil::PrintedAsBinary(buf.buf());
+    LOG(INFO) << butil::ToPrintable(buf.buf());
     ASSERT_TRUE(buf.buf().equals(butil::StringPiece((char*)expected1, sizeof(expected1))));
     for (size_t i = 0; i < ARRAY_SIZE(header1); ++i) {
         brpc::HPacker::Header h;
@@ -526,4 +647,61 @@ TEST_F(HPackTest, responses_with_huffman) {
         ASSERT_EQ(header3[i].value, h.value);
     }
     ASSERT_TRUE(buf.buf().empty());
+}
+
+TEST_F(HPackTest, many_small_indexed_headers) {
+    // Each entry below is a "literal header field with incremental indexing"
+    // (0x40) with a 1-byte name ("a") and an empty value, costing
+    // name(1) + value(0) + 32 = 33 bytes in the dynamic table (rfc7541 4.1).
+    // 121 of them stay under the default 4096-byte table (121*33 = 3993) so
+    // none are evicted and all must decode. The decode table's ring buffer was
+    // previously sized for 34-byte entries (4096/34 = 120), so the 121st
+    // AddHeader() tripped CHECK(!full()) and aborted the process.
+    brpc::HPacker p;
+    ASSERT_EQ(0, p.Init(4096));
+
+    const int num_headers = 121;
+    butil::IOBuf buf;
+    for (int i = 0; i < num_headers; ++i) {
+        const uint8_t entry[] = {0x40, 0x01, (uint8_t)'a', 0x00};
+        buf.append(entry, sizeof(entry));
+    }
+    for (int i = 0; i < num_headers; ++i) {
+        brpc::HPacker::Header h;
+        ASSERT_GT(p.Decode(&buf, &h), 0) << "failed at header " << i;
+        ASSERT_EQ("a", h.name);
+        ASSERT_TRUE(h.value.empty());
+    }
+    ASSERT_TRUE(buf.empty());
+}
+
+TEST_F(HPackTest, zero_size_dynamic_table) {
+    // max_size == 0 disables the dynamic table. num_headers then rounds down to
+    // 0, and malloc(0) may return NULL, so Init must still keep one slot and
+    // succeed. No entry is ever stored because entry_size > max_size.
+    brpc::HPacker p;
+    ASSERT_EQ(0, p.Init(0));
+}
+
+TEST_F(HPackTest, empty_header_name) {
+    // RFC 7541 requires a literal header name to be non-empty. A zero-length
+    // name consumes one byte on the wire (the 0x00 length octet), so the
+    // "name_bytes <= 0" guard in DecodeWithKnownPrefix() did not reject it.
+    // The empty name then reached IndexTable::AddHeader(), whose
+    // CHECK(!h.name.empty()) aborted the process, so a single small HEADERS
+    // frame from an unauthenticated peer could kill an HTTP/2 server.
+    const uint8_t literals[][3] = {
+        {0x40, 0x00, 0x00},  // with incremental indexing
+        {0x00, 0x00, 0x00},  // without indexing
+        {0x10, 0x00, 0x00},  // never indexed
+        {0x40, 0x80, 0x00},  // with incremental indexing, Huffman-encoded name
+    };
+    for (size_t i = 0; i < sizeof(literals) / sizeof(literals[0]); ++i) {
+        brpc::HPacker p;
+        ASSERT_EQ(0, p.Init(4096));
+        butil::IOBuf buf;
+        buf.append(literals[i], sizeof(literals[i]));
+        brpc::HPacker::Header h;
+        ASSERT_EQ(-1, p.Decode(&buf, &h)) << "case " << i;
+    }
 }

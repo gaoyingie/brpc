@@ -1,19 +1,22 @@
-// bthread - A M:N threading library to make applications more concurrent.
-// Copyright (c) 2014 Baidu, Inc.
-// 
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-// 
-//     http://www.apache.org/licenses/LICENSE-2.0
-// 
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
-// Author: Ge,Jun (gejun@baidu.com)
+// bthread - An M:N threading library to make applications more concurrent.
+
 // Date: Sun Aug  3 12:46:15 CST 2014
 
 #include <deque>
@@ -30,10 +33,10 @@ namespace bthread {
 template <typename T, int N>
 class SmallQueue {
 public:
-    SmallQueue() : _begin(0), _size(0), _full(NULL) {}
+    SmallQueue() : _begin(0), _size(0), _full(nullptr) {}
     
     void push(const T& val) {
-        if (_full != NULL && !_full->empty()) {
+        if (_full != nullptr && !_full->empty()) {
             _full->push_back(val);
         } else if (_size < N) {
             int tail = _begin + _size;
@@ -43,7 +46,7 @@ public:
             _c[tail] = val;
             ++_size;
         } else {
-            if (_full == NULL) {
+            if (_full == nullptr) {
                 _full = new std::deque<T>;
             }
             _full->push_back(val);
@@ -66,7 +69,7 @@ public:
         return false;
     }
     bool empty() const {
-        return _size == 0 && (_full == NULL || _full->empty());
+        return _size == 0 && (_full == nullptr || _full->empty());
     }
 
     size_t size() const {
@@ -83,7 +86,7 @@ public:
 
     ~SmallQueue() {
         delete _full;
-        _full = NULL;
+        _full = nullptr;
     }
     
 private:
@@ -101,7 +104,7 @@ struct PendingError {
     std::string error_text;
     const char *location;
 
-    PendingError() : id(INVALID_BTHREAD_ID), error_code(0), location(NULL) {}
+    PendingError() : id(INVALID_BTHREAD_ID), error_code(0), location(nullptr) {}
 };
 
 struct BAIDU_CACHELINE_ALIGNMENT Id {
@@ -111,7 +114,7 @@ struct BAIDU_CACHELINE_ALIGNMENT Id {
     // contended_ver: locked and contended
     uint32_t first_ver;
     uint32_t locked_ver;
-    internal::FastPthreadMutex mutex;
+    FastPthreadMutex mutex;
     void* data;
     int (*on_error)(bthread_id_t, void*, int);
     int (*on_error2)(bthread_id_t, void*, int, const std::string&);
@@ -166,7 +169,7 @@ inline uint32_t get_version(bthread_id_t id) {
 
 inline bool id_exists_with_true_negatives(bthread_id_t id) {
     Id* const meta = address_resource(get_slot(id));
-    if (meta == NULL) {
+    if (meta == nullptr) {
         return false;
     }
     const uint32_t id_ver = bthread::get_version(id);
@@ -175,7 +178,7 @@ inline bool id_exists_with_true_negatives(bthread_id_t id) {
 // required by unittest
 uint32_t id_value(bthread_id_t id) {
     Id* const meta = address_resource(get_slot(id));
-    if (meta != NULL) {
+    if (meta != nullptr) {
         return *meta->butex;
     }
     return 0;  // valid version never be zero
@@ -198,14 +201,14 @@ void id_status(bthread_id_t id, std::ostream &os) {
     const uint32_t id_ver = bthread::get_version(id);
     uint32_t* butex = meta->butex;
     bool valid = true;
-    void* data = NULL;
-    int (*on_error)(bthread_id_t, void*, int) = NULL;
-    int (*on_error2)(bthread_id_t, void*, int, const std::string&) = NULL;
+    void* data = nullptr;
+    int (*on_error)(bthread_id_t, void*, int) = nullptr;
+    int (*on_error2)(bthread_id_t, void*, int, const std::string&) = nullptr;
     uint32_t first_ver = 0;
     uint32_t locked_ver = 0;
     uint32_t unlockable_ver = 0;
     uint32_t contended_ver = 0;
-    const char *lock_location = NULL;
+    const char *lock_location = nullptr;
     SmallQueue<PendingError, 2> pending_q;
     uint32_t butex_value = 0;
 
@@ -288,6 +291,7 @@ void id_pool_status(std::ostream &os) {
 struct IdTraits {
     static const size_t BLOCK_SIZE = 63;
     static const size_t MAX_ENTRIES = 100000;
+    static const size_t INIT_GC_SIZE = 4096;
     static const bthread_id_t ID_INIT;
     static bool exists(bthread_id_t id)
     { return bthread::id_exists_with_true_negatives(id); }
@@ -310,7 +314,7 @@ private:
 };
 
 size_t get_sizes(const bthread_id_list_t* list, size_t* cnt, size_t n) {
-    if (list->impl == NULL) {
+    if (list->impl == nullptr) {
         return 0;
     }
     return static_cast<bthread::IdList*>(list->impl)->get_sizes(cnt, n);
@@ -321,7 +325,7 @@ const int ID_MAX_RANGE = 1024;
 static int id_create_impl(
     bthread_id_t* id, void* data,
     int (*on_error)(bthread_id_t, void*, int),
-    int (*on_error2)(bthread_id_t, void*, int, const std::string&)) __THROW {
+    int (*on_error2)(bthread_id_t, void*, int, const std::string&)) {
     IdResourceId slot;
     Id* const meta = get_resource(&slot);
     if (meta) {
@@ -348,7 +352,7 @@ static int id_create_ranged_impl(
     bthread_id_t* id, void* data,
     int (*on_error)(bthread_id_t, void*, int),
     int (*on_error2)(bthread_id_t, void*, int, const std::string&),
-    int range) __THROW {
+    int range) {
     if (range < 1 || range > ID_MAX_RANGE) {
         LOG_IF(FATAL, range < 1) << "range must be positive, actually " << range;
         LOG_IF(FATAL, range > ID_MAX_RANGE ) << "max of range is " 
@@ -383,23 +387,23 @@ extern "C" {
 
 int bthread_id_create(
     bthread_id_t* id, void* data,
-    int (*on_error)(bthread_id_t, void*, int)) __THROW {
+    int (*on_error)(bthread_id_t, void*, int)) {
     return bthread::id_create_impl(
         id, data,
-        (on_error ? on_error : bthread::default_bthread_id_on_error), NULL);
+        (on_error ? on_error : bthread::default_bthread_id_on_error), nullptr);
 }
 
 int bthread_id_create_ranged(bthread_id_t* id, void* data,
                              int (*on_error)(bthread_id_t, void*, int),
-                             int range) __THROW {
+                             int range) {
     return bthread::id_create_ranged_impl(
         id, data, 
         (on_error ? on_error : bthread::default_bthread_id_on_error),
-        NULL, range);
+        nullptr, range);
 }
 
 int bthread_id_lock_and_reset_range_verbose(
-    bthread_id_t id, void **pdata, int range, const char *location) __THROW {
+    bthread_id_t id, void **pdata, int range, const char *location) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -436,10 +440,9 @@ int bthread_id_lock_and_reset_range_verbose(
             uint32_t expected_ver = *butex;
             meta->mutex.unlock();
             ever_contended = true;
-            if (bthread::butex_wait(butex, expected_ver, NULL) < 0) {
-                if (errno != EWOULDBLOCK && errno != ESTOP) {
-                    return errno;
-                }
+            if (bthread::butex_wait(butex, expected_ver, nullptr) < 0 &&
+                errno != EWOULDBLOCK && errno != EINTR) {
+                return errno;
             }
             meta->mutex.lock();
         } else { // bthread_id_about_to_destroy was called.
@@ -452,11 +455,11 @@ int bthread_id_lock_and_reset_range_verbose(
 }
 
 int bthread_id_error_verbose(bthread_id_t id, int error_code, 
-                             const char *location) __THROW {
+                             const char *location) {
     return bthread_id_error2_verbose(id, error_code, std::string(), location);
 }
 
-int bthread_id_about_to_destroy(bthread_id_t id) __THROW {
+int bthread_id_about_to_destroy(bthread_id_t id) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -483,7 +486,7 @@ int bthread_id_about_to_destroy(bthread_id_t id) __THROW {
     return 0;
 }
 
-int bthread_id_cancel(bthread_id_t id) __THROW {
+int bthread_id_cancel(bthread_id_t id) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -507,37 +510,32 @@ int bthread_id_cancel(bthread_id_t id) __THROW {
     return 0;
 }
 
-int bthread_id_join(bthread_id_t id) __THROW {
+int bthread_id_join(bthread_id_t id) {
     const bthread::IdResourceId slot = bthread::get_slot(id);
     bthread::Id* const meta = address_resource(slot);
     if (!meta) {
+        // The id is not created yet, this join is definitely wrong.
         return EINVAL;
     }
     const uint32_t id_ver = bthread::get_version(id);
     uint32_t* join_butex = meta->join_butex;
-    bool stopped = false;
     while (1) {
         meta->mutex.lock();
         const bool has_ver = meta->has_version(id_ver);
         const uint32_t expected_ver = *join_butex;
         meta->mutex.unlock();
-        if (has_ver) {
-            if (bthread::butex_wait(join_butex, expected_ver, NULL) < 0) {
-                if (errno != EWOULDBLOCK && errno != ESTOP) {
-                    return errno;
-                }
-                if (errno == ESTOP) {
-                    stopped = true;
-                }
-            }
-        } else {
+        if (!has_ver) {
             break;
         }
+        if (bthread::butex_wait(join_butex, expected_ver, nullptr) < 0 &&
+            errno != EWOULDBLOCK && errno != EINTR) {
+            return errno;
+        }
     }
-    return stopped ? ESTOP : 0;
+    return 0;
 }
 
-int bthread_id_trylock(bthread_id_t id, void** pdata) __THROW {
+int bthread_id_trylock(bthread_id_t id, void** pdata) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -555,18 +553,18 @@ int bthread_id_trylock(bthread_id_t id, void** pdata) __THROW {
     }
     *butex = meta->locked_ver;
     meta->mutex.unlock();
-    if (pdata != NULL) {
+    if (pdata != nullptr) {
         *pdata = meta->data;
     }
     return 0;
 }
 
 int bthread_id_lock_verbose(bthread_id_t id, void** pdata,
-                            const char *location) __THROW {
+                            const char *location) {
     return bthread_id_lock_and_reset_range_verbose(id, pdata, 0, location);
 }
 
-int bthread_id_unlock(bthread_id_t id) __THROW {
+int bthread_id_unlock(bthread_id_t id) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -608,7 +606,7 @@ int bthread_id_unlock(bthread_id_t id) __THROW {
     }
 }
 
-int bthread_id_unlock_and_destroy(bthread_id_t id) __THROW {
+int bthread_id_unlock_and_destroy(bthread_id_t id) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -643,8 +641,8 @@ int bthread_id_unlock_and_destroy(bthread_id_t id) __THROW {
 
 int bthread_id_list_init(bthread_id_list_t* list,
                          unsigned /*size*/,
-                         unsigned /*conflict_size*/) __THROW {
-    list->impl = NULL;  // create on demand.
+                         unsigned /*conflict_size*/) {
+    list->impl = nullptr;  // create on demand.
     // Set unused fields to zero as well.
     list->head = 0;
     list->size = 0;
@@ -653,38 +651,35 @@ int bthread_id_list_init(bthread_id_list_t* list,
     return 0;
 }
 
-void bthread_id_list_destroy(bthread_id_list_t* list) __THROW {
+void bthread_id_list_destroy(bthread_id_list_t* list) {
     delete static_cast<bthread::IdList*>(list->impl);
-    list->impl = NULL;
+    list->impl = nullptr;
 }
 
-int bthread_id_list_add(bthread_id_list_t* list, bthread_id_t id) __THROW {
-    if (list->impl == NULL) {
-        list->impl = new (std::nothrow) bthread::IdList;
-        if (NULL == list->impl) {
-            return ENOMEM;
-        }
+int bthread_id_list_add(bthread_id_list_t* list, bthread_id_t id) {
+    if (list->impl == nullptr) {
+        list->impl = new bthread::IdList;
     }
     return static_cast<bthread::IdList*>(list->impl)->add(id);
 }
 
-int bthread_id_list_reset(bthread_id_list_t* list, int error_code) __THROW {
+int bthread_id_list_reset(bthread_id_list_t* list, int error_code) {
     return bthread_id_list_reset2(list, error_code, std::string());
 }
 
 void bthread_id_list_swap(bthread_id_list_t* list1, 
-                          bthread_id_list_t* list2) __THROW {
+                          bthread_id_list_t* list2) {
     std::swap(list1->impl, list2->impl);
 }
 
 int bthread_id_list_reset_pthreadsafe(bthread_id_list_t* list, int error_code,
-                                       pthread_mutex_t* mutex) __THROW {
+                                       pthread_mutex_t* mutex) {
     return bthread_id_list_reset2_pthreadsafe(
         list, error_code, std::string(), mutex);
 }
 
 int bthread_id_list_reset_bthreadsafe(bthread_id_list_t* list, int error_code,
-                                      bthread_mutex_t* mutex) __THROW {
+                                      bthread_mutex_t* mutex) {
     return bthread_id_list_reset2_bthreadsafe(
         list, error_code, std::string(), mutex);
 }
@@ -693,24 +688,24 @@ int bthread_id_list_reset_bthreadsafe(bthread_id_list_t* list, int error_code,
 
 int bthread_id_create2(
     bthread_id_t* id, void* data,
-    int (*on_error)(bthread_id_t, void*, int, const std::string&)) __THROW {
+    int (*on_error)(bthread_id_t, void*, int, const std::string&)) {
     return bthread::id_create_impl(
-        id, data, NULL,
+        id, data, nullptr,
         (on_error ? on_error : bthread::default_bthread_id_on_error2));
 }
 
 int bthread_id_create2_ranged(
     bthread_id_t* id, void* data,
     int (*on_error)(bthread_id_t, void*, int, const std::string&),
-    int range) __THROW {
+    int range) {
     return bthread::id_create_ranged_impl(
-        id, data, NULL,
+        id, data, nullptr,
         (on_error ? on_error : bthread::default_bthread_id_on_error2), range);
 }
 
 int bthread_id_error2_verbose(bthread_id_t id, int error_code,
                               const std::string& error_text,
-                              const char *location) __THROW {
+                              const char *location) {
     bthread::Id* const meta = address_resource(bthread::get_slot(id));
     if (!meta) {
         return EINVAL;
@@ -745,8 +740,8 @@ int bthread_id_error2_verbose(bthread_id_t id, int error_code,
 
 int bthread_id_list_reset2(bthread_id_list_t* list,
                            int error_code,
-                           const std::string& error_text) __THROW {
-    if (list->impl != NULL) {
+                           const std::string& error_text) {
+    if (list->impl != nullptr) {
         static_cast<bthread::IdList*>(list->impl)->apply(
             bthread::IdResetter(error_code, error_text));
     }
@@ -756,11 +751,11 @@ int bthread_id_list_reset2(bthread_id_list_t* list,
 int bthread_id_list_reset2_pthreadsafe(bthread_id_list_t* list,
                                        int error_code,
                                        const std::string& error_text,
-                                       pthread_mutex_t* mutex) __THROW {
-    if (mutex == NULL) {
+                                       pthread_mutex_t* mutex) {
+    if (mutex == nullptr) {
         return EINVAL;
     }
-    if (list->impl == NULL) {
+    if (list->impl == nullptr) {
         return 0;
     }
     bthread_id_list_t tmplist;
@@ -780,11 +775,11 @@ int bthread_id_list_reset2_pthreadsafe(bthread_id_list_t* list,
 int bthread_id_list_reset2_bthreadsafe(bthread_id_list_t* list,
                                        int error_code,
                                        const std::string& error_text,
-                                       bthread_mutex_t* mutex) __THROW {
-    if (mutex == NULL) {
+                                       bthread_mutex_t* mutex) {
+    if (mutex == nullptr) {
         return EINVAL;
     }
-    if (list->impl == NULL) {
+    if (list->impl == nullptr) {
         return 0;
     }
     bthread_id_list_t tmplist;

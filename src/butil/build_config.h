@@ -12,8 +12,8 @@
 //    ARCH_CPU_X86 / ARCH_CPU_X86_64 / ARCH_CPU_X86_FAMILY (X86 or X86_64)
 //    ARCH_CPU_32_BITS / ARCH_CPU_64_BITS
 
-#ifndef BASE_BUILD_CONFIG_H_
-#define BASE_BUILD_CONFIG_H_
+#ifndef BUTIL_BUILD_CONFIG_H_
+#define BUTIL_BUILD_CONFIG_H_
 
 // A set of macros to use for platform detection.
 #if defined(__native_client__)
@@ -133,6 +133,21 @@
 #define ARCH_CPU_32_BITS 1
 #define ARCH_CPU_LITTLE_ENDIAN 1
 #endif
+#elif defined(__loongarch64)
+#define ARCH_CPU_LOONGARCH64_FAMILY 1
+#define ARCH_CPU_LOONGARCH64 1
+#define ARCH_CPU_64_BITS 1
+#define ARCH_CPU_LITTLE_ENDIAN 1
+#elif defined(__riscv)
+#define ARCH_CPU_RISCV_FAMILY 1
+#if defined(__riscv_xlen) && (__riscv_xlen == 64)
+#define ARCH_CPU_RISCV64 1
+#define ARCH_CPU_64_BITS 1
+#else
+#define ARCH_CPU_RISCV32 1
+#define ARCH_CPU_32_BITS 1
+#endif
+#define ARCH_CPU_LITTLE_ENDIAN 1
 #else
 #error Please add support for your architecture in butil/build_config.h
 #endif
@@ -162,17 +177,17 @@
 #define STD_STRING_ITERATOR_IS_CHAR_POINTER
 // The compiler thinks butil::string16::const_iterator and "char16*" are
 // equivalent types.
-#define BASE_STRING16_ITERATOR_IS_CHAR16_POINTER
+#define BUTIL_STRING16_ITERATOR_IS_CHAR16_POINTER
 #endif
 
 #if defined(__GXX_EXPERIMENTAL_CXX0X__) || __cplusplus >= 201103L
-#define BASE_CXX11_ENABLED 1
+#define BUTIL_CXX11_ENABLED 1
 #endif
 
-#if !defined(BASE_CXX11_ENABLED)
+#if !defined(BUTIL_CXX11_ENABLED)
 #define nullptr NULL
 #endif
 
 #define HAVE_DLADDR
 
-#endif  // BASE_BUILD_CONFIG_H_
+#endif  // BUTIL_BUILD_CONFIG_H_

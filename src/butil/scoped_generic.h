@@ -2,15 +2,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#ifndef BASE_SCOPED_GENERIC_H_
-#define BASE_SCOPED_GENERIC_H_
+#ifndef BUTIL_SCOPED_GENERIC_H_
+#define BUTIL_SCOPED_GENERIC_H_
 
 #include <stdlib.h>
 
 #include <algorithm>
+#include <utility>
 
 #include "butil/compiler_specific.h"
-#include "butil/move.h"
+#include "butil/macros.h"
 
 namespace butil {
 
@@ -53,8 +54,6 @@ namespace butil {
 //   typedef ScopedGeneric<int, FooScopedTraits> ScopedFoo;
 template<typename T, typename Traits>
 class ScopedGeneric {
-  MOVE_ONLY_TYPE_FOR_CPP_03(ScopedGeneric, RValue)
-
  private:
   // This must be first since it's used inline below.
   //
@@ -83,21 +82,24 @@ class ScopedGeneric {
       : data_(value, traits) {
   }
 
-  // Move constructor for C++03 move emulation.
-  ScopedGeneric(RValue rvalue)
-      : data_(rvalue.object->release(), rvalue.object->get_traits()) {
+  DISALLOW_COPY_AND_ASSIGN(ScopedGeneric);
+
+  ScopedGeneric(ScopedGeneric&& other)
+      : data_(other.release(), other.get_traits()) {
   }
+
+  ScopedGeneric& operator=(ScopedGeneric&&) = delete;
 
   ~ScopedGeneric() {
     FreeIfNecessary();
   }
 
   // Frees the currently owned object, if any. Then takes ownership of a new
-  // object, if given. Self-resets are not allowd as on scoped_ptr. See
+  // object, if given. Self-resets are not allowed as on scoped_ptr. See
   // http://crbug.com/162971
   void reset(const element_type& value = traits_type::InvalidValue()) {
-    if (data_.generic != traits_type::InvalidValue() && data_.generic == value)
-      abort();
+    RELEASE_ASSERT(data_.generic == traits_type::InvalidValue() ||
+                   data_.generic != value);
     FreeIfNecessary();
     data_.generic = value;
   }
@@ -173,4 +175,4 @@ bool operator!=(const T& value, const ScopedGeneric<T, Traits>& scoped) {
 
 }  // namespace butil
 
-#endif  // BASE_SCOPED_GENERIC_H_
+#endif  // BUTIL_SCOPED_GENERIC_H_
